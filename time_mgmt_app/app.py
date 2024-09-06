@@ -77,7 +77,8 @@ fun_messages_final = [
 # Function to calculate leave time
 def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_time=None):
     workday_duration = timedelta(hours=8)
-    
+
+    # Only process if lunch times are given
     if start_lunch and end_lunch:
         total_lunch_time = end_lunch - start_lunch
         # Convert lunch duration into hours and minutes for message clarity
@@ -152,4 +153,3 @@ if entry_time:
     calculate_leave_time(entry_time, start_lunch, end_lunch, leave_time)
 else:
     st.write("Yo! Give me your entry time, at least, you slacker!")
-
