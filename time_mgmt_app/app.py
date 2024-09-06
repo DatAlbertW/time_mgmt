@@ -86,15 +86,15 @@ def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_tim
         total_lunch_time = timedelta(0)
         lunch_duration_str = "00:00"
     
-    # If only entry time is provided
+    # First input: Only entry time is provided
     if start_lunch is None:
         leave_time_30min = entry_time + workday_duration + timedelta(minutes=30)
         leave_time_1hr = entry_time + workday_duration + timedelta(hours=1)
         st.write(random.choice(fun_messages_entry))
         st.write(f"📅 With a 30 min lunch, you can leave at: **{leave_time_30min.strftime('%H:%M:%S')}**.")
         st.write(f"📅 With a 1 hour lunch, you can leave at: **{leave_time_1hr.strftime('%H:%M:%S')}**.")
-        
-    # If entry time and start lunch are provided
+    
+    # Second input: Start lunch is provided, but not the end lunch time
     elif end_lunch is None:
         time_worked_until_lunch = start_lunch - entry_time
         leave_time_30min = start_lunch + workday_duration - time_worked_until_lunch + timedelta(minutes=30)
@@ -104,13 +104,11 @@ def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_tim
         st.write(f"📅 With a 30 min lunch, you can leave at: **{leave_time_30min.strftime('%H:%M:%S')}**.")
         st.write(f"📅 With a 1 hour lunch, you can leave at: **{leave_time_1hr.strftime('%H:%M:%S')}**.")
         
-    # If entry time, start lunch, and end lunch are provided (show after-lunch messages)
+    # Third input: End lunch time is provided (show after-lunch messages)
     else:
-        # Corrected: Calculating the actual time worked based on inputs
         total_time_worked = (end_lunch - entry_time) - total_lunch_time
         remaining_work_time = workday_duration - total_time_worked
         
-        # Avoid negative time and calculate based on 8-hour workday
         if remaining_work_time.total_seconds() > 0:
             leave_time = end_lunch + remaining_work_time
             hours_left = remaining_work_time.total_seconds() // 3600
@@ -122,7 +120,7 @@ def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_tim
         else:
             st.write("Yo! You’re cutting it short! Cover that time tomorrow, or you’re gonna hear about it. ⏳")
     
-    # If entry time, start lunch, end lunch, and leave office time are provided
+    # Fourth input: Leave time is provided
     if leave_time and start_lunch and end_lunch:
         total_time_worked = leave_time - entry_time - total_lunch_time
         if total_time_worked >= timedelta(hours=8):
