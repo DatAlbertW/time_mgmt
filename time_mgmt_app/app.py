@@ -152,3 +152,4 @@ if entry_time:
     calculate_leave_time(entry_time, start_lunch, end_lunch, leave_time)
 else:
     st.write("Yo! Give me your entry time, at least, you slacker!")
+
