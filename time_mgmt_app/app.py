@@ -77,8 +77,7 @@ fun_messages_final = [
 # Function to calculate leave time
 def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_time=None):
     workday_duration = timedelta(hours=8)
-
-    # Only process if lunch times are given
+    
     if start_lunch and end_lunch:
         total_lunch_time = end_lunch - start_lunch
         # Convert lunch duration into hours and minutes for message clarity
@@ -126,8 +125,11 @@ def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_tim
     # If entry time, start lunch, end lunch, and leave office time are provided
     if leave_time and start_lunch and end_lunch:
         total_time_worked = leave_time - entry_time - total_lunch_time
-        st.write(f"⏳ Total work hours (excluding lunch): **{total_time_worked}**.")
-        st.write(random.choice(fun_messages_final))
+        if total_time_worked >= timedelta(hours=8):
+            st.write(f"⏳ Total work hours (excluding lunch): **{total_time_worked}**.")
+            st.write(random.choice(fun_messages_final))
+        else:
+            st.write("Yo! You’re cutting it short! Cover that time tomorrow, or you’re gonna hear about it. ⏳")
 
 # App interface
 st.title("🎯 Workday Calculator 🎯")
