@@ -64,6 +64,11 @@ fun_messages_final = [
 def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_time=None):
     workday_duration = timedelta(hours=8)
     
+    if start_lunch and end_lunch:
+        total_lunch_time = end_lunch - start_lunch
+    else:
+        total_lunch_time = timedelta(0)
+    
     # If only entry time is provided
     if start_lunch is None:
         leave_time_30min = entry_time + workday_duration + timedelta(minutes=30)
@@ -84,29 +89,26 @@ def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_tim
         
     # If entry time, start lunch, and end lunch are provided
     else:
-        total_lunch_time = end_lunch - start_lunch
-        time_worked_after_lunch = datetime.now() - end_lunch
+        total_time_worked = datetime.now() - entry_time - total_lunch_time
         
-        if time_worked_after_lunch < timedelta(0):  # Avoid negative time issues
-            time_worked_after_lunch = timedelta(0)
+        remaining_work_time = workday_duration - total_time_worked
         
-        remaining_work_time = workday_duration - (start_lunch - entry_time) - time_worked_after_lunch
-        
-        if remaining_work_time < timedelta(0):  # Avoid negative remaining work time
-            remaining_work_time = timedelta(0)
-        
-        leave_time = datetime.now() + remaining_work_time
-        hours_left = remaining_work_time.total_seconds() // 3600
-        minutes_left = (remaining_work_time.total_seconds() % 3600) // 60
-        
-        st.write(random.choice(fun_messages_leave))
-        st.write(f"⏳ You have **{int(hours_left)} hours and {int(minutes_left)} minutes** left.")
-        st.write(f"🎉 You can leave at: **{leave_time.strftime('%H:%M:%S')}** 🎉.")
-
+        # Avoid negative time and calculate based on 8-hour workday
+        if remaining_work_time.total_seconds() > 0:
+            leave_time = datetime.now() + remaining_work_time
+            hours_left = remaining_work_time.total_seconds() // 3600
+            minutes_left = (remaining_work_time.total_seconds() % 3600) // 60
+            
+            st.write(random.choice(fun_messages_leave))
+            st.write(f"⏳ You have **{int(hours_left)} hours and {int(minutes_left)} minutes** left.")
+            st.write(f"🎉 You can leave at: **{leave_time.strftime('%H:%M:%S')}** 🎉.")
+        else:
+            st.write(random.choice(fun_messages_final))
+    
     # If entry time, start lunch, end lunch, and leave office time are provided
-    if leave_time:
-        total_time_worked = leave_time - entry_time + (end_lunch - start_lunch)
-        if total_time_worked >= timedelta(hours=8, minutes=30):
+    if leave_time and start_lunch and end_lunch:
+        total_time_worked = leave_time - entry_time - total_lunch_time
+        if total_time_worked >= timedelta(hours=8):
             st.write(random.choice(fun_messages_final))
         else:
             st.write("Yo! You’re cutting it short! Cover that time tomorrow, or you’re gonna hear about it. ⏳")
@@ -122,10 +124,13 @@ end_lunch_str = st.text_input("Enter the end of your lunch time (HH:MM:SS, optio
 leave_time_str = st.text_input("Enter your actual leave time (HH:MM:SS, optional)", "")
 
 # Convert inputs to datetime
-entry_time = datetime.strptime(entry_time_str, "%H:%M:%S") if entry_time_str else None
-start_lunch = datetime.strptime(start_lunch_str, "%H:%M:%S") if start_lunch_str else None
-end_lunch = datetime.strptime(end_lunch_str, "%H:%M:%S") if end_lunch_str else None
-leave_time = datetime.strptime(leave_time_str, "%H:%M:%S") if leave_time_str else None
+try:
+    entry_time = datetime.strptime(entry_time_str, "%H:%M:%S") if entry_time_str else None
+    start_lunch = datetime.strptime(start_lunch_str, "%H:%M:%S") if start_lunch_str else None
+    end_lunch = datetime.strptime(end_lunch_str, "%H:%M:%S") if end_lunch_str else None
+    leave_time = datetime.strptime(leave_time_str, "%H:%M:%S") if leave_time_str else None
+except ValueError:
+    st.error("Invalid time format. Please use HH:MM:SS")
 
 # Perform calculations based on input
 if entry_time:
