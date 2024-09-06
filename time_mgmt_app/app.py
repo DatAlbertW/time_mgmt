@@ -64,38 +64,44 @@ fun_messages_final = [
 def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_time=None):
     workday_duration = timedelta(hours=8)
     
+    # Get current time
+    current_time = datetime.now()
+    
     # If only entry time is provided
     if start_lunch is None:
         leave_time_30min = entry_time + workday_duration + timedelta(minutes=30)
         leave_time_1hr = entry_time + workday_duration + timedelta(hours=1)
+        st.write(random.choice(fun_messages_entry))
         st.write(f"📅 With a 30 min lunch, you can leave at: **{leave_time_30min.strftime('%H:%M:%S')}**.")
         st.write(f"📅 With a 1 hour lunch, you can leave at: **{leave_time_1hr.strftime('%H:%M:%S')}**.")
-        st.write(random.choice(fun_messages_entry))
         
     # If entry time and start lunch are provided
     elif end_lunch is None:
         time_worked_until_lunch = start_lunch - entry_time
         leave_time_30min = start_lunch + workday_duration - time_worked_until_lunch + timedelta(minutes=30)
         leave_time_1hr = start_lunch + workday_duration - time_worked_until_lunch + timedelta(hours=1)
-        st.write(f"⏳ You’ve worked for: **{time_worked_until_lunch}** hours so far. Good job, but don’t stop now, fool! 😉")
+        st.write(random.choice(fun_messages_lunch))
         st.write(f"📅 With a 30 min lunch, you can leave at: **{leave_time_30min.strftime('%H:%M:%S')}**.")
         st.write(f"📅 With a 1 hour lunch, you can leave at: **{leave_time_1hr.strftime('%H:%M:%S')}**.")
-        st.write(random.choice(fun_messages_lunch))
         
     # If entry time, start lunch, and end lunch are provided
     else:
         total_lunch_time = end_lunch - start_lunch
-        time_worked_after_lunch = datetime.now() - end_lunch
+        time_worked_after_lunch = current_time - end_lunch
         remaining_work_time = workday_duration - (start_lunch - entry_time) - time_worked_after_lunch
-        leave_time = datetime.now() + remaining_work_time
         
-        st.write(f"⏳ You have **{remaining_work_time.total_seconds() // 3600:.0f} hours and {(remaining_work_time.total_seconds() % 3600) // 60:.0f} minutes** left.")
-        st.write(f"🎉 You can leave at: **{leave_time.strftime('%H:%M:%S')}** 🎉.")
-        st.write(random.choice(fun_messages_leave))
-
+        # Check for negative remaining time and handle it
+        if remaining_work_time.total_seconds() > 0:
+            leave_time = current_time + remaining_work_time
+            st.write(random.choice(fun_messages_leave))
+            st.write(f"⏳ You have **{int(remaining_work_time.total_seconds() // 3600)} hours and {int((remaining_work_time.total_seconds() % 3600) // 60)} minutes** left.")
+            st.write(f"🎉 You can leave at: **{leave_time.strftime('%H:%M:%S')}** 🎉.")
+        else:
+            st.write("Yo! You’re already done, get outta here!")
+        
     # If entry time, start lunch, end lunch, and leave office time are provided
     if leave_time:
-        total_time_worked = leave_time - entry_time + (end_lunch - start_lunch)
+        total_time_worked = leave_time - entry_time + total_lunch_time
         if total_time_worked >= timedelta(hours=8, minutes=30):
             st.write(random.choice(fun_messages_final))
         else:
@@ -122,3 +128,4 @@ if entry_time:
     calculate_leave_time(entry_time, start_lunch, end_lunch, leave_time)
 else:
     st.write("Yo! Give me your entry time, at least, you slacker!")
+
