@@ -120,7 +120,7 @@ def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_tim
             st.write(f"📅 You had a {lunch_duration_str} lunch, you can leave at: **{leave_time.strftime('%H:%M:%S')}**.")
             st.write(f"⏳ You have **{int(hours_left)} hours and {int(minutes_left)} minutes** left.")
         else:
-            st.write(random.choice(fun_messages_final))
+            st.write("Yo! You’re cutting it short! Cover that time tomorrow, or you’re gonna hear about it. ⏳")
     
     # If entry time, start lunch, end lunch, and leave office time are provided
     if leave_time and start_lunch and end_lunch:
