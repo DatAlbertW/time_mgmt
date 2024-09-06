@@ -106,12 +106,13 @@ def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_tim
         
     # If entry time, start lunch, and end lunch are provided (show after-lunch messages)
     else:
-        total_time_worked = datetime.now() - entry_time - total_lunch_time
+        # Corrected: Calculating the actual time worked based on inputs
+        total_time_worked = (end_lunch - entry_time) - total_lunch_time
         remaining_work_time = workday_duration - total_time_worked
         
         # Avoid negative time and calculate based on 8-hour workday
         if remaining_work_time.total_seconds() > 0:
-            leave_time = datetime.now() + remaining_work_time
+            leave_time = end_lunch + remaining_work_time
             hours_left = remaining_work_time.total_seconds() // 3600
             minutes_left = (remaining_work_time.total_seconds() % 3600) // 60
             
@@ -151,4 +152,3 @@ if entry_time:
     calculate_leave_time(entry_time, start_lunch, end_lunch, leave_time)
 else:
     st.write("Yo! Give me your entry time, at least, you slacker!")
-
