@@ -32,6 +32,20 @@ fun_messages_lunch = [
     "Don’t get comfy with that lunch. This ain’t a 5-star hotel. Eat up and get back to it. 🍔",
 ]
 
+# After lunch messages
+after_lunch_messages = [
+    "Lunch is over, my dude. Time to get back to the grind. No more slacking! 🕛",
+    "Lunch break's done, champ. Clock’s ticking, let's finish strong. 🍽️",
+    "Hope you enjoyed that break. Time to get back and pretend to work again. 😜",
+    "Alright, enough slacking. Lunch is over. Let’s finish this day without falling asleep, alright? 💤",
+    "Lunch break is over, homie! Now, back to the grind like a true hustler. 💼",
+    "Lunch break’s done, bro. Time to earn that paycheck... well, sorta. 🏢",
+    "Yo, break's over! Clock's still ticking. Time to finish what you started. 🕛",
+    "Lunch break done? Good. Now pretend like you’re busy until the end of the day. 📅",
+    "No more chillin’, let’s get this day over with. Lunch is history, clock’s still running. ⏳",
+    "Hope you didn’t eat too much. You still gotta make it through the day without falling asleep! 😴",
+]
+
 # Leave messages
 fun_messages_leave = [
     "Yo, it’s quittin’ time, bitch! Get out before they trap you with more BS! 🏃‍♂️",
@@ -46,28 +60,17 @@ fun_messages_leave = [
     "Run, fool, run! It’s time to go ghost before they start asking questions. 👻",
 ]
 
-# Final messages (after full workday)
-fun_messages_final = [
-    "Yo, you’re done! Go home, sit your ass down, and chill, my dude. 🏡",
-    "That’s it, champ. You put in the time, now go grab a drink and forget about this place. 🍻",
-    "You survived, and now it’s time to go home and pretend this day never happened. 😏",
-    "Alright, tiger, you did your thing. Now bounce before they change their mind. 😂",
-    "What the hell are you still doing here? You’re not earning extra brownie points, so GTFO! 🏆",
-    "Congrats, hustler. Now get out before they change the rules on you and you’re stuck here. 🏃",
-    "Wrap it up, chief. Grab yourself a beer and crash – you’ve earned it, kinda. 🍺",
-    "And that’s a wrap, bro. Now go binge something dumb on Netflix. 📺",
-    "You done, superhero? Cool. Now go home and do absolutely nothing. You deserve it. 🦸",
-    "Yo, the day’s over. Go disappear for the night. This place ain’t worth thinking about. 🌃",
-]
-
 # Function to calculate leave time
 def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_time=None):
     workday_duration = timedelta(hours=8)
     
     if start_lunch and end_lunch:
         total_lunch_time = end_lunch - start_lunch
+        # Convert lunch duration into hours and minutes for message clarity
+        lunch_duration_str = f"{total_lunch_time.seconds//3600}:{(total_lunch_time.seconds//60)%60:02d} hours"
     else:
         total_lunch_time = timedelta(0)
+        lunch_duration_str = "00:00"
     
     # If only entry time is provided
     if start_lunch is None:
@@ -87,7 +90,7 @@ def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_tim
         st.write(f"📅 With a 30 min lunch, you can leave at: **{leave_time_30min.strftime('%H:%M:%S')}**.")
         st.write(f"📅 With a 1 hour lunch, you can leave at: **{leave_time_1hr.strftime('%H:%M:%S')}**.")
         
-    # If entry time, start lunch, and end lunch are provided
+    # If entry time, start lunch, and end lunch are provided (show after-lunch messages)
     else:
         total_time_worked = datetime.now() - entry_time - total_lunch_time
         remaining_work_time = workday_duration - total_time_worked
@@ -98,8 +101,9 @@ def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_tim
             hours_left = remaining_work_time.total_seconds() // 3600
             minutes_left = (remaining_work_time.total_seconds() % 3600) // 60
             
+            st.write(random.choice(after_lunch_messages))
+            st.write(f"📅 You had a {lunch_duration_str} lunch, you can leave at: **{leave_time.strftime('%H:%M:%S')}**.")
             st.write(f"⏳ You have **{int(hours_left)} hours and {int(minutes_left)} minutes** left.")
-            st.write(f"🎉 You can leave at: **{leave_time.strftime('%H:%M:%S')}** 🎉.")
         else:
             st.write(random.choice(fun_messages_final))
     
