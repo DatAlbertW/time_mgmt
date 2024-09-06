@@ -60,6 +60,20 @@ fun_messages_leave = [
     "Run, fool, run! It’s time to go ghost before they start asking questions. 👻",
 ]
 
+# Final messages (for after work is fully completed)
+fun_messages_final = [
+    "Yo, you’re done! Go home, sit your ass down, and chill, my dude. 🏡",
+    "That’s it, champ. You put in the time, now go grab a drink and forget about this place. 🍻",
+    "You survived, and now it’s time to go home and pretend this day never happened. 😏",
+    "Alright, tiger, you did your thing. Now bounce before they change their mind. 😂",
+    "What the hell are you still doing here? You’re not earning extra brownie points, so GTFO! 🏆",
+    "Congrats, hustler. Now get out before they change the rules on you and you’re stuck here. 🏃",
+    "Wrap it up, chief. Grab yourself a beer and crash – you’ve earned it, kinda. 🍺",
+    "And that’s a wrap, bro. Now go binge something dumb on Netflix. 📺",
+    "You done, superhero? Cool. Now go home and do absolutely nothing. You deserve it. 🦸",
+    "Yo, the day’s over. Go disappear for the night. This place ain’t worth thinking about. 🌃",
+]
+
 # Function to calculate leave time
 def calculate_leave_time(entry_time, start_lunch=None, end_lunch=None, leave_time=None):
     workday_duration = timedelta(hours=8)
@@ -137,3 +151,4 @@ if entry_time:
     calculate_leave_time(entry_time, start_lunch, end_lunch, leave_time)
 else:
     st.write("Yo! Give me your entry time, at least, you slacker!")
+
