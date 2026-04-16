@@ -4,7 +4,7 @@ import random
  
 st.set_page_config(
     page_title="⚗️ Workday Calculator",
-    page_icon="⚗️",
+    page_icon="None",
     layout="centered",
 )
  
@@ -345,7 +345,7 @@ def run(entry, start_lunch, end_lunch, leave):
  
 # ─── PAGE ───────────────────────────────────────────────────────────────────
  
-st.markdown("<h1>⚗️ JESSE'S WORKDAY<br>CALCULATOR ⚗️</h1>", unsafe_allow_html=True)
+st.markdown("<h1>⚗️ WORKDAY<br>CALCULATOR ⚗️</h1>", unsafe_allow_html=True)
 st.markdown(
     "<p style='text-align:center;color:#555;font-style:italic;font-size:0.95rem;"
     "font-family:Barlow,sans-serif;margin-top:0'>Yeah, science! ...of getting outta work on time, bitch.</p>",
