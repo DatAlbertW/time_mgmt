@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import random
  
 st.set_page_config(
-    page_title="⚗️ Jesse's Workday Calculator",
+    page_title="⚗️ Workday Calculator",
     page_icon="⚗️",
     layout="centered",
 )
