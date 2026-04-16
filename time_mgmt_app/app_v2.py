@@ -1,8 +1,8 @@
 import streamlit as st
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-import time
 import random
+import time
+from zoneinfo import ZoneInfo          # stdlib, Python >= 3.9
  
 st.set_page_config(
     page_title="⚗️ Workday Calculator",
@@ -100,25 +100,28 @@ hr {
     color: #e8dcc8 !important;
 }
  
-/* ── Live clock badge ── */
-.live-clock {
-    display: flex;
+/* ── Live badge ── */
+.live-badge {
+    display: inline-flex;
     align-items: center;
-    justify-content: center;
-    gap: 10px;
-    margin: 0 0 12px 0;
+    gap: 6px;
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 20px;
+    padding: 3px 12px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.75rem;
+    color: #555;
+    float: right;
+    margin-top: -2px;
 }
 .live-dot {
-    width: 8px; height: 8px;
-    border-radius: 50%;
+    width: 7px;
+    height: 7px;
     background: #2ecc71;
-    box-shadow: 0 0 6px #2ecc71;
-    animation: pulse 1.5s infinite;
-    flex-shrink: 0;
-}
-@keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50%       { opacity: 0.3; }
+    border-radius: 50%;
+    display: inline-block;
+    box-shadow: 0 0 6px #2ecc7188;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -179,17 +182,16 @@ SHORT_MSG = [
  
 # ─── HELPERS ────────────────────────────────────────────────────────────────
  
-ZURICH_TZ = ZoneInfo("Europe/Zurich")
+TZ = ZoneInfo("Europe/Zurich")   # CET in winter, CEST in summer — auto
  
  
-def now_zurich() -> datetime:
-    """Current time in Zurich, stripped to minute precision (no tz info, for arithmetic)."""
-    n = datetime.now(ZURICH_TZ)
-    return datetime(n.year, n.month, n.day, n.hour, n.minute, n.second)
+def get_now() -> datetime:
+    """Current time in Europe/Zurich, stripped of tzinfo for arithmetic."""
+    n = datetime.now(TZ)
+    return n.replace(tzinfo=None, year=1900, month=1, day=1)
  
  
 def parse_time(raw: str):
-    """Accept many formats: 8:30, 08:30, 08:30:00, 8:30 AM, 8.30, etc."""
     if not raw or not raw.strip():
         return None
     s = raw.strip().upper()
@@ -209,16 +211,6 @@ def fmt_td(td: timedelta) -> str:
     return f"{h}h {m:02d}m"
  
  
-def fmt_td_hms(td: timedelta) -> str:
-    """Format with seconds for the live countdown."""
-    total = abs(int(td.total_seconds()))
-    h, rem = divmod(total, 3600)
-    m, s = divmod(rem, 60)
-    if h > 0:
-        return f"{h}h {m:02d}m {s:02d}s"
-    return f"{m:02d}m {s:02d}s"
- 
- 
 def pct_color(p: float) -> str:
     if p >= 1.0: return "#2ecc71"
     if p >= 0.6: return "#f5c518"
@@ -226,6 +218,15 @@ def pct_color(p: float) -> str:
  
  
 # ─── UI COMPONENTS ──────────────────────────────────────────────────────────
+ 
+def live_stamp(now: datetime):
+    """Small 'LIVE · HH:MM:SS CET' badge floated right."""
+    st.markdown(
+        f'<div class="live-badge"><span class="live-dot"></span>'
+        f'LIVE &nbsp;·&nbsp; {now.strftime("%H:%M:%S")} CET</div>',
+        unsafe_allow_html=True,
+    )
+ 
  
 def progress_bar(pct: float, label: str):
     p = min(max(pct, 0), 1)
@@ -271,52 +272,12 @@ border-radius:6px;padding:8px 16px;margin:4px 6px 4px 0;text-align:center;min-wi
 </div>""", unsafe_allow_html=True)
  
  
-def live_clock_bar(now: datetime):
-    """Compact live clock strip shown at the top of live states."""
-    st.markdown(f"""
-<div class="live-clock">
-  <div class="live-dot"></div>
-  <span style="font-family:'Share Tech Mono',monospace;color:#555;font-size:0.85rem;
-  letter-spacing:1px">ZURICH</span>
-  <span style="font-family:'Bebas Neue',sans-serif;font-size:1.6rem;
-  color:#e8dcc8;letter-spacing:3px">{now.strftime('%H:%M:%S')}</span>
-</div>""", unsafe_allow_html=True)
- 
- 
-def remaining_card(worked: timedelta, remaining: timedelta, pct: float):
-    """Live metrics block: worked so far + remaining."""
-    color_rem = pct_color(pct)
-    done = remaining.total_seconds() <= 0
-    rem_label = "✅ DONE — GO HOME" if done else fmt_td_hms(remaining)
-    rem_color = "#2ecc71" if done else color_rem
- 
-    st.markdown(f"""
-<div style="display:flex;gap:12px;margin:12px 0">
-  <div style="flex:1;background:#161616;border:1px solid #2a2a2a;border-radius:8px;
-  padding:12px 16px;text-align:center">
-    <div style="color:#555;font-size:0.7rem;letter-spacing:1px;text-transform:uppercase;
-    font-family:'Barlow',sans-serif;margin-bottom:4px">⏱ worked so far</div>
-    <div style="color:#f5c518;font-family:'Bebas Neue',sans-serif;font-size:1.7rem;
-    letter-spacing:2px">{fmt_td_hms(worked)}</div>
-  </div>
-  <div style="flex:1;background:#161616;border:1px solid {rem_color}44;border-radius:8px;
-  padding:12px 16px;text-align:center">
-    <div style="color:#555;font-size:0.7rem;letter-spacing:1px;text-transform:uppercase;
-    font-family:'Barlow',sans-serif;margin-bottom:4px">⏳ remaining</div>
-    <div style="color:{rem_color};font-family:'Bebas Neue',sans-serif;font-size:1.7rem;
-    letter-spacing:2px">{rem_label}</div>
-  </div>
-</div>""", unsafe_allow_html=True)
- 
- 
 # ─── CALCULATOR LOGIC ───────────────────────────────────────────────────────
  
 WORKDAY = timedelta(hours=8)
  
  
-def run(entry, start_lunch, end_lunch, leave):
-    now = now_zurich()
-    needs_live = leave is None  # live mode: no leave time entered yet
+def run(entry, start_lunch, end_lunch, leave, now):
  
     # ══ STATE 4 — Leave time provided ═══════════════════════════════════════
     if leave:
@@ -359,24 +320,33 @@ def run(entry, start_lunch, end_lunch, leave):
  
     # ══ STATE 3 — Back from lunch ════════════════════════════════════════════
     elif end_lunch and start_lunch:
-        pre_lunch = start_lunch - entry
-        lunch_dur = end_lunch - start_lunch
-        remaining_work = WORKDAY - pre_lunch
-        predicted_leave = end_lunch + remaining_work
-        pct = pre_lunch / WORKDAY
- 
-        # Live: worked = pre-lunch + time since end_lunch
-        post_lunch = now - end_lunch
-        worked_now = pre_lunch + max(post_lunch, timedelta(0))
-        remaining_now = max(WORKDAY - worked_now, timedelta(0))
-        pct_now = min(worked_now / WORKDAY, 1.0)
+        pre_lunch       = start_lunch - entry
+        lunch_dur       = end_lunch - start_lunch
+        worked_after    = max(now - end_lunch, timedelta(0))
+        total_worked    = pre_lunch + worked_after
+        remaining       = max(WORKDAY - total_worked, timedelta(0))
+        predicted_leave = end_lunch + (WORKDAY - pre_lunch)
+        pct             = total_worked / WORKDAY
  
         st.markdown("### 🍽️ Back from Lunch")
+        live_stamp(now)
         jesse_says(random.choice(AFTER_LUNCH_MSG))
+        progress_bar(
+            pct,
+            f"{min(pct,1)*100:.1f}% of workday done"
+            + (f" — {fmt_td(remaining)} still to go" if remaining.total_seconds() > 0 else " — FULL DAY DONE 🔥")
+        )
  
-        live_clock_bar(now)
-        remaining_card(worked_now, remaining_now, pct_now)
-        progress_bar(pct_now, f"{pct_now*100:.1f}% of workday done — {fmt_td(remaining_now)} to go")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("⏱️ Total Worked", fmt_td(total_worked))
+        with c2:
+            st.metric("🍽️ Lunch", fmt_td(lunch_dur))
+        with c3:
+            if remaining.total_seconds() > 0:
+                st.metric("⏳ Remaining", fmt_td(remaining))
+            else:
+                st.metric("🔥 Overtime", fmt_td(total_worked - WORKDAY))
  
         st.markdown("")
         result_card(
@@ -387,43 +357,25 @@ def run(entry, start_lunch, end_lunch, leave):
  
     # ══ STATE 2 — At lunch ═══════════════════════════════════════════════════
     elif start_lunch:
-        worked_pre = start_lunch - entry
-        remaining_after_lunch = WORKDAY - worked_pre
-        leave_30 = start_lunch + remaining_after_lunch + timedelta(minutes=30)
-        leave_60 = start_lunch + remaining_after_lunch + timedelta(hours=1)
-        pct = worked_pre / WORKDAY
- 
-        # Live: current lunch duration
-        lunch_so_far = now - start_lunch
-        lunch_so_far = max(lunch_so_far, timedelta(0))
+        worked_so_far         = start_lunch - entry
+        lunch_so_far          = max(now - start_lunch, timedelta(0))
+        remaining_after_lunch = max(WORKDAY - worked_so_far, timedelta(0))
+        leave_30              = start_lunch + remaining_after_lunch + timedelta(minutes=30)
+        leave_60              = start_lunch + remaining_after_lunch + timedelta(hours=1)
+        pct                   = worked_so_far / WORKDAY
  
         st.markdown("### 🌮 Lunch Break")
+        live_stamp(now)
         jesse_says(random.choice(LUNCH_START_MSG))
- 
-        live_clock_bar(now)
- 
-        # Show pre-lunch worked + live lunch ticker
-        st.markdown(f"""
-<div style="display:flex;gap:12px;margin:12px 0">
-  <div style="flex:1;background:#161616;border:1px solid #2a2a2a;border-radius:8px;
-  padding:12px 16px;text-align:center">
-    <div style="color:#555;font-size:0.7rem;letter-spacing:1px;text-transform:uppercase;
-    font-family:'Barlow',sans-serif;margin-bottom:4px">⏱ worked pre-lunch</div>
-    <div style="color:#f5c518;font-family:'Bebas Neue',sans-serif;font-size:1.7rem;
-    letter-spacing:2px">{fmt_td(worked_pre)}</div>
-  </div>
-  <div style="flex:1;background:#161616;border:1px solid #e74c3c44;border-radius:8px;
-  padding:12px 16px;text-align:center">
-    <div style="color:#555;font-size:0.7rem;letter-spacing:1px;text-transform:uppercase;
-    font-family:'Barlow',sans-serif;margin-bottom:4px">🍔 lunch so far</div>
-    <div style="color:#e74c3c;font-family:'Bebas Neue',sans-serif;font-size:1.7rem;
-    letter-spacing:2px">{fmt_td_hms(lunch_so_far)}</div>
-  </div>
-</div>""", unsafe_allow_html=True)
- 
         progress_bar(pct, f"{pct*100:.1f}% of workday done — eating on company time now")
-        st.markdown("")
  
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("⏱️ Worked (pre-lunch)", fmt_td(worked_so_far))
+        with c2:
+            st.metric("🍔 Lunch so far", fmt_td(lunch_so_far))
+ 
+        st.markdown("")
         result_card("Depending on your lunch:")
         c1, c2 = st.columns(2)
         with c1:
@@ -435,21 +387,31 @@ def run(entry, start_lunch, end_lunch, leave):
  
     # ══ STATE 1 — Entry only ════════════════════════════════════════════════
     else:
-        leave_30 = entry + WORKDAY + timedelta(minutes=30)
-        leave_60 = entry + WORKDAY + timedelta(hours=1)
- 
-        # Live: worked = now - entry; remaining = 8h - worked
-        worked_now = now - entry
-        worked_now = max(worked_now, timedelta(0))
+        worked_now    = max(now - entry, timedelta(0))
         remaining_now = max(WORKDAY - worked_now, timedelta(0))
-        pct_now = min(worked_now / WORKDAY, 1.0)
+        overtime_now  = max(worked_now - WORKDAY, timedelta(0))
+        pct_now       = worked_now / WORKDAY
+        leave_30      = entry + WORKDAY + timedelta(minutes=30)
+        leave_60      = entry + WORKDAY + timedelta(hours=1)
  
-        st.markdown("### 🕐 Day Started")
+        st.markdown("### 🕐 Day in Progress")
+        live_stamp(now)
         jesse_says(random.choice(ENTRY_MSG))
  
-        live_clock_bar(now)
-        remaining_card(worked_now, remaining_now, pct_now)
-        progress_bar(pct_now, f"{pct_now*100:.1f}% — {fmt_td(remaining_now)} left (excl. lunch)")
+        progress_bar(
+            pct_now,
+            f"{min(pct_now,1)*100:.1f}% done"
+            + (f" — {fmt_td(remaining_now)} left" if remaining_now.total_seconds() > 0 else " — FULL DAY LOGGED 🔥")
+        )
+ 
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("⏱️ Worked so far", fmt_td(worked_now))
+        with c2:
+            if remaining_now.total_seconds() > 0:
+                st.metric("⏳ Remaining", fmt_td(remaining_now))
+            else:
+                st.metric("🔥 Overtime", fmt_td(overtime_now))
  
         st.markdown("")
         result_card("Depending on your lunch:")
@@ -460,8 +422,6 @@ def run(entry, start_lunch, end_lunch, leave):
         with c2:
             time_badge("1-hour lunch", leave_60)
             st.markdown("<div style='color:#666;font-size:0.8rem;text-align:center'>Leave at ↑</div>", unsafe_allow_html=True)
- 
-    return needs_live
  
  
 # ─── PAGE ───────────────────────────────────────────────────────────────────
@@ -474,7 +434,6 @@ st.markdown(
 )
 st.markdown("---")
  
-# Inputs in a 2-column grid
 col_a, col_b = st.columns(2)
 with col_a:
     entry_raw      = st.text_input("🕐 Entry time",              placeholder="08:30  /  8:30 AM  /  08:30:00")
@@ -485,11 +444,11 @@ with col_b:
  
 st.markdown("---")
  
-# Parse & validate
 entry       = parse_time(entry_raw)
 start_lunch = parse_time(start_lunch_raw)
 end_lunch   = parse_time(end_lunch_raw)
 leave       = parse_time(leave_raw)
+now         = get_now()
  
 bad = [(lbl, raw) for lbl, raw, val in [
     ("Entry",       entry_raw,       entry),
@@ -511,8 +470,9 @@ elif not entry:
         unsafe_allow_html=True
     )
 else:
-    needs_live = run(entry, start_lunch, end_lunch, leave)
-    # Live refresh every 30 seconds when no leave time is entered
-    if needs_live:
-        time.sleep(30)
-        st.rerun()
+    run(entry, start_lunch, end_lunch, leave, now)
+ 
+# ─── LIVE AUTO-REFRESH (only when no leave time — still counting down) ──────
+if entry and not leave and not bad:
+    time.sleep(60)
+    st.rerun()
