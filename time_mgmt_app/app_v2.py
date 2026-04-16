@@ -345,7 +345,7 @@ def run(entry, start_lunch, end_lunch, leave):
  
 # ─── PAGE ───────────────────────────────────────────────────────────────────
  
-st.markdown("<h1>⚗️ WORKDAY<br>CALCULATOR ⚗️</h1>", unsafe_allow_html=True)
+st.markdown("<h1>⚗️ WORKDAY CALCULATOR ⚗️</h1>", unsafe_allow_html=True)
 st.markdown(
     "<p style='text-align:center;color:#555;font-style:italic;font-size:0.95rem;"
     "font-family:Barlow,sans-serif;margin-top:0'>Yeah, science! ...of getting outta work on time, bitch.</p>",
