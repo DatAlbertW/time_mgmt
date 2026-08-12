@@ -109,12 +109,19 @@ label {
 }
 
 /* ── Buttons ──────────────────────────────────────────────────────────────
-   Streamlit nests the button label inside <p>/<span>/<div>, so the colour has
-   to be forced on descendants as well. Without this, glyph-only buttons such
-   as the edit pencil inherit the default light text colour and read as white. */
-.stButton > button,
-.stDownloadButton > button {
+   Two things matter here.
+   1. DESCENDANT selectors, not direct-child. A button with help= is wrapped by
+      Streamlit in an extra tooltip div, so `.stButton > button` misses it and
+      the button falls back to the default white style.
+   2. The label sits in a nested <p>/<span>, so colour must be forced on
+      descendants too, or glyph-only buttons render pale.                     */
+.stButton button,
+.stDownloadButton button,
+[data-testid="stTooltipHoverTarget"] button,
+button[data-testid="stBaseButton-secondary"],
+button[data-testid="baseButton-secondary"] {
     background: #161616 !important;
+    background-color: #161616 !important;
     color: #f5c518 !important;
     border: 1px solid #2a2a2a !important;
     border-radius: 6px !important;
@@ -123,28 +130,35 @@ label {
     letter-spacing: 0.5px;
     transition: all .2s ease;
 }
-.stButton > button *,
-.stDownloadButton > button * {
+.stButton button *,
+.stDownloadButton button *,
+[data-testid="stTooltipHoverTarget"] button * {
     color: #f5c518 !important;
     fill: #f5c518 !important;
 }
-.stButton > button:hover,
-.stDownloadButton > button:hover {
+.stButton button:hover,
+.stDownloadButton button:hover,
+[data-testid="stTooltipHoverTarget"] button:hover {
     border-color: #f5c518 !important;
     box-shadow: 0 0 10px rgba(245,197,24,0.25) !important;
-    background: #1c1c1c !important;
+    background-color: #1c1c1c !important;
 }
-.stButton > button:hover *,
-.stDownloadButton > button:hover * { color: #f5c518 !important; }
-.stButton > button:focus,
-.stButton > button:active,
-.stButton > button:focus:not(:active) {
+.stButton button:hover *,
+.stDownloadButton button:hover *,
+[data-testid="stTooltipHoverTarget"] button:hover * { color: #f5c518 !important; }
+.stButton button:focus,
+.stButton button:active,
+.stButton button:focus:not(:active),
+[data-testid="stTooltipHoverTarget"] button:focus,
+[data-testid="stTooltipHoverTarget"] button:active {
+    background-color: #161616 !important;
     color: #f5c518 !important;
     border-color: #f5c518 !important;
     box-shadow: none !important;
 }
-.stButton > button:focus *,
-.stButton > button:active * { color: #f5c518 !important; }
+.stButton button:focus *,
+.stButton button:active *,
+[data-testid="stTooltipHoverTarget"] button:focus * { color: #f5c518 !important; }
 
 hr {
     border: none !important;
