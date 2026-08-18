@@ -1,14 +1,30 @@
+"""
+WORKDAY TRACKER
+===============
+Single-file Streamlit app. No requirements.txt needed, no files written to disk.
+
+Design constraints this version respects:
+  * Stdlib only. The sole third-party import is streamlit itself.
+  * Nothing is read from or written to the filesystem. All state lives in
+    st.session_state, so the app behaves identically on Streamlit Community
+    Cloud, where the container filesystem is ephemeral and shared.
+  * No blocking sleep/rerun loop, ever. Older Streamlit versions simply get a
+    manual refresh button instead of a live clock. The app can therefore never
+    sit in a permanent "loading" state because of this code.
+  * Every newer Streamlit API is feature-detected before use.
+
+Because there is no persistence, a browser refresh clears the log. Use the
+CSV/TXT download buttons before closing the tab.
+"""
+
 import streamlit as st
-from datetime import datetime, timedelta, date as date_cls
-import random
-import time
-import json
+from datetime import datetime, timedelta
 import csv
+import inspect
 import io
-import os
+import random
 import smtplib
 from email.message import EmailMessage
-from zoneinfo import ZoneInfo          # stdlib, Python >= 3.9
 
 st.set_page_config(
     page_title="Workday Tracker",
@@ -16,30 +32,62 @@ st.set_page_config(
     layout="centered",
 )
 
-TZ = ZoneInfo("Europe/Zurich")         # CET in winter, CEST in summer, auto
-BACKUP_FILE = "workday_backup.json"     # local safety net
 WORKDAY = timedelta(hours=8)
 LABELS = ["Meeting", "Jira", "Training", "Other"]
 RECONCILE_TOLERANCE = 15 * 60           # seconds of gap treated as "close enough"
+STALE_TIMER_SECONDS = 12 * 3600         # flag timers that look forgotten
 
-# ─── FRAGMENT COMPATIBILITY ─────────────────────────────────────────────────
-# st.fragment (1.37+) or st.experimental_fragment (1.33+). If neither exists we
-# fall back to the old whole-page sleep/rerun loop at the bottom of the file.
+# ─── CAPABILITY DETECTION ───────────────────────────────────────────────────
+# Everything below is checked at import time so no call site has to guess what
+# the installed Streamlit version supports.
+
+def _tz():
+    """Europe/Zurich if the tz database is available, otherwise machine local."""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("Europe/Zurich")
+    except Exception:
+        return None
+
+TZ = _tz()
+
 _FRAG = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
 HAS_FRAGMENT = _FRAG is not None
 
-def as_fragment(fn, run_every=None):
-    """Wrap fn as an auto-refreshing fragment when the runtime supports it."""
-    if HAS_FRAGMENT:
-        return _FRAG(run_every=run_every)(fn)
-    return fn
+_RERUN = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+
+def _rerun_takes_scope() -> bool:
+    try:
+        return "scope" in inspect.signature(_RERUN).parameters
+    except Exception:
+        return False
+
+RERUN_HAS_SCOPE = _rerun_takes_scope()
 
 def rerun_app():
-    """Rerun the whole app, even when called from inside a fragment."""
+    """Rerun the whole app, including when called from inside a fragment."""
+    if _RERUN is None:
+        return
+    if RERUN_HAS_SCOPE:
+        _RERUN(scope="app")
+    else:
+        _RERUN()
+
+def button(label, **kwargs):
+    """st.button that tolerates older versions lacking use_container_width."""
     try:
-        st.rerun(scope="app")
+        return st.button(label, **kwargs)
     except TypeError:
-        st.rerun()
+        kwargs.pop("use_container_width", None)
+        return st.button(label, **kwargs)
+
+def text_input(label, **kwargs):
+    """st.text_input that tolerates older versions lacking placeholder."""
+    try:
+        return st.text_input(label, **kwargs)
+    except TypeError:
+        kwargs.pop("placeholder", None)
+        return st.text_input(label, **kwargs)
 
 # ─── THEME ──────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -51,9 +99,9 @@ html, body,
     background-color: #0e0e0e !important;
     color: #e8dcc8 !important;
 }
-[data-testid="stHeader"]            { background: transparent !important; }
-[data-testid="stSidebar"]           { background: #111 !important; }
-section.main > div                  { padding-top: 1.5rem; }
+[data-testid="stHeader"]  { background: transparent !important; }
+[data-testid="stSidebar"] { background: #111 !important; }
+section.main > div        { padding-top: 1.5rem; }
 h1 {
     font-family: 'Bebas Neue', sans-serif !important;
     color: #f5c518 !important;
@@ -100,7 +148,6 @@ label {
     text-transform: uppercase;
     letter-spacing: 1px;
 }
-[data-testid="stMetricDelta"] { font-size: 0.8rem !important; }
 [data-testid="metric-container"] {
     background: #161616;
     border: 1px solid #2a2a2a;
@@ -109,12 +156,13 @@ label {
 }
 
 /* ── Buttons ──────────────────────────────────────────────────────────────
-   Two things matter here.
-   1. DESCENDANT selectors, not direct-child. A button with help= is wrapped by
-      Streamlit in an extra tooltip div, so `.stButton > button` misses it and
-      the button falls back to the default white style.
+   1. DESCENDANT selectors, not direct-child. A button with help= gets wrapped
+      in an extra tooltip div, so `.stButton > button` misses it and the button
+      falls back to the default white style.
    2. The label sits in a nested <p>/<span>, so colour must be forced on
-      descendants too, or glyph-only buttons render pale.                     */
+      descendants too, or glyph-only buttons render pale.
+   3. Avoid colour-emoji glyphs in labels: they are painted by the font and
+      ignore CSS colour entirely.                                            */
 .stButton button,
 .stDownloadButton button,
 [data-testid="stTooltipHoverTarget"] button,
@@ -197,6 +245,11 @@ hr {
     color: #6f6a60; font-size: 0.8rem; font-family: 'Barlow', sans-serif;
     margin: 2px 0 8px 0;
 }
+.session-warning {
+    background: #161616; border: 1px solid #3a2f14; border-left: 4px solid #f5c518;
+    border-radius: 0 8px 8px 0; padding: 10px 16px; margin: 6px 0 14px 0;
+    color: #b9ad97; font-size: 0.85rem; font-family: 'Barlow', sans-serif;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -251,10 +304,8 @@ RELABEL_MSG = [
     "Saved. Good tracking is tracking what actually happened.",
 ]
 
-# ─── STABLE COACH MESSAGES ──────────────────────────────────────────────────
-# Chosen once per event and cached, so a refresh no longer reshuffles the line
-# on every tick.
 def coach_msg(key: str, pool) -> str:
+    """Pick a line once per event and keep it, so refreshes don't reshuffle it."""
     store = st.session_state.setdefault("coach_msgs", {})
     if key not in store:
         store[key] = random.choice(pool)
@@ -265,61 +316,34 @@ def refresh_coach(*keys):
     for k in keys:
         store.pop(k, None)
 
-# ─── PERSISTENCE (LOCAL BACKUP) ─────────────────────────────────────────────
-def load_state():
-    try:
-        if os.path.exists(BACKUP_FILE):
-            with open(BACKUP_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {"activities": [], "active": None}
-
-def save_state():
-    try:
-        with open(BACKUP_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "activities": st.session_state.activities,
-                    "active": st.session_state.active,
-                },
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
-    except Exception:
-        # Never crash on a backup write. The download and email paths remain.
-        pass
-
-if "loaded" not in st.session_state:
-    data = load_state()
-    st.session_state.activities = data.get("activities", [])
-    st.session_state.active = data.get("active", None)
-    st.session_state.loaded = True
-    st.session_state.confirm = None     # holds a pending confirmation key
-
-st.session_state.setdefault("editing_active", False)   # editing the running block
-st.session_state.setdefault("editing_idx", None)       # log entry being edited
-st.session_state.setdefault("edit_token", "0")         # freshens widget keys per edit
-st.session_state.setdefault("edit_flash", None)        # message after a successful save
-st.session_state.setdefault("show_manual", False)      # retroactive entry form open
+# ─── SESSION STATE (the only storage this app has) ──────────────────────────
+st.session_state.setdefault("activities", [])       # registered blocks
+st.session_state.setdefault("active", None)         # running/paused block
+st.session_state.setdefault("confirm", None)        # pending confirmation key
+st.session_state.setdefault("editing_active", False)
+st.session_state.setdefault("editing_idx", None)
+st.session_state.setdefault("edit_token", "0")
+st.session_state.setdefault("edit_flash", None)
+st.session_state.setdefault("show_manual", False)
 st.session_state.setdefault("coach_msgs", {})
 
 # ─── TIME HELPERS ───────────────────────────────────────────────────────────
 def real_now() -> datetime:
-    return datetime.now(TZ)
+    if TZ is not None:
+        return datetime.now(TZ)
+    return datetime.now().astimezone()
 
 def today_str() -> str:
     return real_now().strftime("%Y-%m-%d")
 
 def active_elapsed() -> float:
-    """Seconds elapsed on the active timer, running or paused."""
+    """Seconds on the active timer, running or paused."""
     a = st.session_state.active
     if not a:
         return 0.0
     secs = float(a.get("accumulated", 0.0))
     if a.get("running") and a.get("resumed_at"):
-        secs += (real_now() - datetime.fromisoformat(a["resumed_at"])).total_seconds()
+        secs += (real_now() - a["resumed_at"]).total_seconds()
     return max(secs, 0.0)
 
 def fmt_clock(seconds: float) -> str:
@@ -334,7 +358,11 @@ def fmt_hm(seconds: float) -> str:
     m = rem // 60
     return f"{h}h {m:02d}m"
 
+def fmt_td(td: timedelta) -> str:
+    return fmt_hm(td.total_seconds())
+
 def parse_time(raw: str):
+    """Accept 08:30, 8:30, 08:30:00, 8:30 AM, 8.30 and friends."""
     if not raw or not raw.strip():
         return None
     s = raw.strip().upper()
@@ -346,8 +374,19 @@ def parse_time(raw: str):
             continue
     return None
 
-def fmt_td(td: timedelta) -> str:
-    return fmt_hm(td.total_seconds())
+def parse_date(raw: str):
+    if not raw or not raw.strip():
+        return None
+    s = raw.strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+def span_seconds(start_dt: datetime, end_dt: datetime) -> int:
+    return int((end_dt - start_dt).total_seconds())
 
 def pct_color(p: float) -> str:
     if p >= 1.0:
@@ -356,48 +395,42 @@ def pct_color(p: float) -> str:
         return "#f5c518"
     return "#e67e22"
 
-def span_seconds(start_dt: datetime, end_dt: datetime) -> int:
-    return int((end_dt - start_dt).total_seconds())
-
 # ─── TIMER ACTIONS ──────────────────────────────────────────────────────────
 def sort_activities():
     st.session_state.activities.sort(key=lambda a: (a.get("date", ""), a.get("start", "")))
 
 def start_activity(label: str, description: str):
+    now = real_now()
     st.session_state.active = {
         "label": label,
         "description": description.strip(),
         "accumulated": 0.0,
         "running": True,
-        "resumed_at": real_now().isoformat(),
-        "created_at": real_now().isoformat(),
+        "resumed_at": now,      # datetime objects are fine, nothing is serialised
+        "created_at": now,
     }
     refresh_coach("timer_start")
-    save_state()
 
 def pause_activity():
     a = st.session_state.active
     if a and a.get("running") and a.get("resumed_at"):
-        a["accumulated"] = float(a.get("accumulated", 0.0)) + (
-            real_now() - datetime.fromisoformat(a["resumed_at"])
-        ).total_seconds()
+        a["accumulated"] = float(a.get("accumulated", 0.0)) + \
+            (real_now() - a["resumed_at"]).total_seconds()
         a["running"] = False
         a["resumed_at"] = None
-        save_state()
 
 def resume_activity():
     a = st.session_state.active
     if a and not a.get("running"):
-        a["resumed_at"] = real_now().isoformat()
+        a["resumed_at"] = real_now()
         a["running"] = True
-        save_state()
 
 def register_activity():
     a = st.session_state.active
     if not a:
         return
     duration = active_elapsed()
-    start_dt = datetime.fromisoformat(a["created_at"])
+    start_dt = a["created_at"]
     end_dt = real_now()
     st.session_state.activities.append({
         "date": start_dt.strftime("%Y-%m-%d"),
@@ -410,15 +443,12 @@ def register_activity():
     sort_activities()
     st.session_state.active = None
     refresh_coach("register", "timer_start")
-    save_state()
 
 def discard_activity():
     st.session_state.active = None
     refresh_coach("timer_start")
-    save_state()
 
-def add_manual_entry(day: str, label: str, description: str,
-                     start_txt: str, end_txt: str, duration_seconds: int):
+def add_manual_entry(day, label, description, start_txt, end_txt, duration_seconds):
     st.session_state.activities.append({
         "date": day,
         "label": label,
@@ -429,16 +459,13 @@ def add_manual_entry(day: str, label: str, description: str,
     })
     sort_activities()
     refresh_coach("register")
-    save_state()
 
 def delete_entry(idx: int):
     if 0 <= idx < len(st.session_state.activities):
         st.session_state.activities.pop(idx)
-        save_state()
 
 def clear_log():
     st.session_state.activities = []
-    save_state()
 
 # ─── EDIT HELPERS ───────────────────────────────────────────────────────────
 def open_editor(target):
@@ -446,26 +473,21 @@ def open_editor(target):
     st.session_state.editing_active = (target == "active")
     st.session_state.editing_idx = target if isinstance(target, int) else None
     # A fresh token gives the edit widgets fresh keys, so they load current
-    # values rather than whatever was typed the last time an editor was open.
-    st.session_state.edit_token = str(time.time_ns())
+    # values rather than whatever was typed last time an editor was open.
+    st.session_state.edit_token = real_now().strftime("%H%M%S%f")
     st.session_state.edit_flash = None
 
 def close_editors():
     st.session_state.editing_active = False
     st.session_state.editing_idx = None
 
-def editors_open() -> bool:
-    return bool(st.session_state.editing_active or st.session_state.editing_idx is not None)
-
 def update_active_meta(label: str, description: str):
     a = st.session_state.active
     if a:
         a["label"] = label
         a["description"] = description.strip()
-        save_state()
 
-def update_entry(idx: int, label: str, description: str,
-                 day: str, start_txt: str, end_txt: str, duration_seconds: int):
+def update_entry(idx, label, description, day, start_txt, end_txt, duration_seconds):
     if 0 <= idx < len(st.session_state.activities):
         st.session_state.activities[idx].update({
             "label": label,
@@ -476,7 +498,6 @@ def update_entry(idx: int, label: str, description: str,
             "duration_seconds": int(duration_seconds),
         })
         sort_activities()
-        save_state()
 
 def type_picker(current_label: str, key_prefix: str):
     """Selectbox plus custom field, pre-filled from the current label."""
@@ -489,12 +510,10 @@ def type_picker(current_label: str, key_prefix: str):
     with c2:
         custom = ""
         if sel == "Other":
-            custom = st.text_input(
-                "Custom type",
-                value=current_label if is_custom else "",
-                key=f"{key_prefix}_custom",
-                placeholder="e.g. Code review",
-            )
+            custom = text_input("Custom type",
+                                value=current_label if is_custom else "",
+                                key=f"{key_prefix}_custom",
+                                placeholder="e.g. Code review")
     return sel, custom.strip()
 
 def resolve_label(sel: str, custom: str) -> str:
@@ -506,12 +525,8 @@ def tracked_today_seconds() -> float:
     total = sum(a["duration_seconds"] for a in st.session_state.activities
                 if a.get("date") == day)
     a = st.session_state.active
-    if a:
-        try:
-            if datetime.fromisoformat(a["created_at"]).strftime("%Y-%m-%d") == day:
-                total += active_elapsed()
-        except Exception:
-            pass
+    if a and a["created_at"].strftime("%Y-%m-%d") == day:
+        total += active_elapsed()
     return float(total)
 
 def suggest_entry_time():
@@ -519,20 +534,15 @@ def suggest_entry_time():
     day = today_str()
     starts = [a["start"] for a in st.session_state.activities if a.get("date") == day]
     a = st.session_state.active
-    if a:
-        try:
-            created = datetime.fromisoformat(a["created_at"])
-            if created.strftime("%Y-%m-%d") == day:
-                starts.append(created.strftime("%H:%M"))
-        except Exception:
-            pass
+    if a and a["created_at"].strftime("%Y-%m-%d") == day:
+        starts.append(a["created_at"].strftime("%H:%M"))
     return min(starts) if starts else None
 
 # ─── UI COMPONENTS ──────────────────────────────────────────────────────────
 def live_stamp(now: datetime):
     st.markdown(
         f'<div class="live-badge"><span class="live-dot"></span>'
-        f'LIVE &nbsp;&middot;&nbsp; {now.strftime("%H:%M:%S")} CET</div>',
+        f'LIVE &nbsp;&middot;&nbsp; {now.strftime("%H:%M:%S")}</div>',
         unsafe_allow_html=True,
     )
 
@@ -543,8 +553,7 @@ def progress_bar(pct: float, label: str, color: str = None):
 <div style="margin:12px 0 4px 0">
   <div style="background:#222;border-radius:6px;overflow:hidden;height:16px">
     <div style="width:{p*100:.1f}%;background:{c};height:100%;
-    border-radius:6px;transition:width .4s ease;
-    box-shadow:0 0 8px {c}88"></div>
+    border-radius:6px;transition:width .4s ease;box-shadow:0 0 8px {c}88"></div>
   </div>
   <div style="color:#777;font-size:0.8rem;margin-top:4px;font-family:'Share Tech Mono',monospace">
     {label}
@@ -576,6 +585,9 @@ border-radius:6px;padding:8px 16px;margin:4px 6px 4px 0;text-align:center;min-wi
   letter-spacing:2px">{t.strftime('%H:%M')}</div>
 </div>""", unsafe_allow_html=True)
 
+def note(text: str):
+    st.markdown(f"<div class='section-note'>{text}</div>", unsafe_allow_html=True)
+
 # ─── EXPORT HELPERS ─────────────────────────────────────────────────────────
 def build_summary_text() -> str:
     acts = st.session_state.activities
@@ -601,9 +613,8 @@ def build_summary_text() -> str:
         lines.append("  Entries:")
         for a in entries:
             desc = f" ({a['description']})" if a["description"] else ""
-            lines.append(
-                f"    {a['start']} to {a['end']}  {a['label']}{desc}: {fmt_hm(a['duration_seconds'])}"
-            )
+            lines.append(f"    {a['start']} to {a['end']}  "
+                         f"{a['label']}{desc}: {fmt_hm(a['duration_seconds'])}")
         lines.append("")
         grand_total += day_total
     if len(by_date) > 1:
@@ -629,7 +640,7 @@ def email_configured() -> bool:
     except Exception:
         return False
 
-def send_backup_email() -> tuple[bool, str]:
+def send_backup_email():
     if not email_configured():
         return False, "Email is not configured. See the setup note below."
     try:
@@ -640,9 +651,7 @@ def send_backup_email() -> tuple[bool, str]:
         msg["To"] = cfg["recipient"]
         msg.set_content(build_summary_text())
         msg.add_attachment(
-            build_csv_bytes(),
-            maintype="text",
-            subtype="csv",
+            build_csv_bytes(), maintype="text", subtype="csv",
             filename=f"workday_{real_now().strftime('%Y%m%d_%H%M')}.csv",
         )
         with smtplib.SMTP(cfg["smtp_server"], int(cfg["smtp_port"])) as server:
@@ -653,9 +662,9 @@ def send_backup_email() -> tuple[bool, str]:
     except Exception as e:
         return False, f"Email failed: {e}"
 
-# ─── ACTIVITY TIMER SECTION ─────────────────────────────────────────────────
+# ─── LIVE CLOCK CARD ────────────────────────────────────────────────────────
 def live_activity_card():
-    """Only the ticking card. Isolated so the 1s refresh touches nothing else."""
+    """Only the ticking card, so an auto-refresh touches nothing else."""
     a = st.session_state.active
     if not a:
         return
@@ -672,10 +681,12 @@ padding:18px;margin:6px 0 12px 0">
     <div style="color:{status_color};font-family:'Share Tech Mono',monospace;
     font-size:0.8rem;letter-spacing:2px">{status_text}</div>
   </div>
-  <div style="color:#8a8170;font-size:0.9rem;margin-top:2px">{a['description'] or 'No description'}</div>
+  <div style="color:#8a8170;font-size:0.9rem;margin-top:2px">
+  {a['description'] or 'No description'}</div>
   <div class="big-clock" style="margin-top:10px">{fmt_clock(elapsed)}</div>
 </div>""", unsafe_allow_html=True)
 
+# ─── ACTIVITY TIMER SECTION ─────────────────────────────────────────────────
 def render_timer():
     st.markdown("### ⏱️ Activity Timer")
     a = st.session_state.active
@@ -689,53 +700,63 @@ def render_timer():
         with c2:
             custom = ""
             if label == "Other":
-                custom = st.text_input("Custom label", key="new_custom",
-                                       placeholder="e.g. Code review")
-        desc = st.text_input("Description (optional, but always available)",
-                             key="new_desc", placeholder="What are you working on?")
+                custom = text_input("Custom label", key="new_custom",
+                                    placeholder="e.g. Code review")
+        desc = text_input("Description (optional, but always available)",
+                          key="new_desc", placeholder="What are you working on?")
         final_label = custom.strip() if (label == "Other" and custom.strip()) else label
-        if st.button("▶  Start timer", use_container_width=True):
+        if button("▶  Start timer", use_container_width=True):
             if label == "Other" and not custom.strip() and not desc.strip():
                 st.warning("Add a custom label or a description so this block is identifiable.")
             else:
                 start_activity(final_label, desc)
                 rerun_app()
-        st.markdown("<div class='section-note'>Started the wrong thing? Any block can be "
-                    "re-typed and renamed later, while it runs or after it's registered."
-                    "</div>", unsafe_allow_html=True)
+        note("Started the wrong thing? Any block can be re-typed and renamed later, "
+             "while it runs or after it's registered.")
         return
 
     # ── Active timer present ──
     running = a.get("running")
     if running and HAS_FRAGMENT:
-        as_fragment(live_activity_card, "1s")()
+        live_card_auto()          # refreshes itself once a second
     else:
         live_activity_card()
 
     elapsed = active_elapsed()
 
+    if running and elapsed > STALE_TIMER_SECONDS:
+        st.warning(f"This timer has been running for {fmt_hm(elapsed)}. If you left it "
+                   f"going by accident, edit the times after registering, or discard it.")
+
+    if running and not HAS_FRAGMENT:
+        if button("⟳  Refresh clock", key="manual_tick"):
+            rerun_app()
+        note("Your Streamlit version doesn't support auto-refreshing fragments, so the "
+             "clock updates when you refresh. The elapsed time is computed from "
+             "timestamps, so nothing is lost in between.")
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         if running:
-            if st.button("⏸  Pause", use_container_width=True):
+            if button("⏸  Pause", use_container_width=True):
                 pause_activity()
                 rerun_app()
         else:
-            if st.button("▶  Resume", use_container_width=True):
+            if button("▶  Resume", use_container_width=True):
                 resume_activity()
                 rerun_app()
     with c2:
-        if st.button("✎  Edit", use_container_width=True,
-                     help="Change the type or title of this running block"):
+        if button("Edit", use_container_width=True,
+                  help="Change the type or title of this running block"):
             open_editor("active")
             rerun_app()
     with c3:
-        if st.button("Register", use_container_width=True):
+        if button("Register", use_container_width=True):
             close_editors()
             st.session_state.confirm = "register"
             rerun_app()
     with c4:
-        if st.button("Discard", use_container_width=True):
+        if button("Discard", use_container_width=True):
             close_editors()
             st.session_state.confirm = "discard"
             rerun_app()
@@ -743,21 +764,20 @@ def render_timer():
     # ── Inline editor for the live block ──
     if st.session_state.editing_active:
         token = st.session_state.edit_token
-        st.markdown('<div class="edit-panel-title">✎ EDIT THIS BLOCK</div>'
+        st.markdown('<div class="edit-panel-title">EDIT THIS BLOCK</div>'
                     '<div class="edit-panel-sub">Ended up doing something else? '
                     'Re-type and rename it. The elapsed time stays exactly as it is.</div>',
                     unsafe_allow_html=True)
         sel, custom = type_picker(a["label"], f"activeedit_{token}")
-        new_desc = st.text_input("Title / description",
-                                 value=a.get("description", ""),
-                                 key=f"activeedit_{token}_desc",
-                                 placeholder="What are you actually working on?")
+        new_desc = text_input("Title / description", value=a.get("description", ""),
+                              key=f"activeedit_{token}_desc",
+                              placeholder="What are you actually working on?")
         new_label = resolve_label(sel, custom)
 
         e1, e2 = st.columns(2)
         with e1:
-            if st.button("Save changes", use_container_width=True,
-                         key=f"activeedit_{token}_save"):
+            if button("Save changes", use_container_width=True,
+                      key=f"activeedit_{token}_save"):
                 if sel == "Other" and not custom and not new_desc.strip():
                     st.warning("Add a custom type or a title so this block stays identifiable.")
                 else:
@@ -766,8 +786,8 @@ def render_timer():
                     st.session_state.edit_flash = random.choice(RELABEL_MSG)
                     rerun_app()
         with e2:
-            if st.button("Cancel", use_container_width=True,
-                         key=f"activeedit_{token}_cancel"):
+            if button("Cancel", use_container_width=True,
+                      key=f"activeedit_{token}_cancel"):
                 close_editors()
                 rerun_app()
 
@@ -777,16 +797,15 @@ def render_timer():
 
     # ── Confirmations ──
     if st.session_state.confirm == "register":
-        st.warning(f"Are you sure you want to register this task?  "
-                   f"**{a['label']}** at **{fmt_hm(elapsed)}**.")
+        st.warning(f"Register this task?  **{a['label']}** at **{fmt_hm(elapsed)}**.")
         cc1, cc2 = st.columns(2)
         with cc1:
-            if st.button("Yes, register it", use_container_width=True):
+            if button("Yes, register it", use_container_width=True, key="conf_reg_yes"):
                 register_activity()
                 st.session_state.confirm = None
                 rerun_app()
         with cc2:
-            if st.button("Cancel", use_container_width=True):
+            if button("Cancel", use_container_width=True, key="conf_reg_no"):
                 st.session_state.confirm = None
                 rerun_app()
 
@@ -794,77 +813,74 @@ def render_timer():
         st.warning("Discard this timer without registering it? This cannot be undone.")
         cc1, cc2 = st.columns(2)
         with cc1:
-            if st.button("Yes, discard", use_container_width=True):
+            if button("Yes, discard", use_container_width=True, key="conf_dis_yes"):
                 discard_activity()
                 st.session_state.confirm = None
                 rerun_app()
         with cc2:
-            if st.button("Keep it", use_container_width=True):
+            if button("Keep it", use_container_width=True, key="conf_dis_no"):
                 st.session_state.confirm = None
                 rerun_app()
 
-    st.markdown("<div class='section-note'>Switched tasks mid-block? Hit Edit to re-type and "
-                "rename it. To split the time instead, register this one and start the next."
-                "</div>", unsafe_allow_html=True)
+    note("Switched tasks mid-block? Hit Edit to re-type and rename it. To split the time "
+         "instead, register this one and start the next.")
 
 # ─── RETROACTIVE ENTRY ──────────────────────────────────────────────────────
 def render_manual_entry():
     if not st.session_state.show_manual:
-        if st.button("＋  Log a past block", use_container_width=True, key="open_manual"):
+        if button("＋  Log a past block", use_container_width=True, key="open_manual"):
             st.session_state.show_manual = True
             rerun_app()
-        st.markdown("<div class='section-note'>Forgot to hit start? Add the block by hand "
-                    "with its real start and end times.</div>", unsafe_allow_html=True)
+        note("Forgot to hit start? Add the block by hand with its real start and end times.")
         return
 
-    st.markdown('<div class="edit-panel-title">＋ LOG A PAST BLOCK</div>'
+    st.markdown('<div class="edit-panel-title">LOG A PAST BLOCK</div>'
                 '<div class="edit-panel-sub">For work that happened without the timer '
                 'running. Duration is calculated from start and end.</div>',
                 unsafe_allow_html=True)
 
     d1, d2, d3 = st.columns([2, 1, 1])
     with d1:
-        day = st.date_input("Date", value=real_now().date(), key="man_date")
+        day_raw = text_input("Date", value=today_str(), key="man_date",
+                             placeholder="YYYY-MM-DD")
     with d2:
-        start_raw = st.text_input("Start", key="man_start", placeholder="09:15")
+        start_raw = text_input("Start", key="man_start", placeholder="09:15")
     with d3:
-        end_raw = st.text_input("End", key="man_end", placeholder="10:00")
+        end_raw = text_input("End", key="man_end", placeholder="10:00")
 
     sel, custom = type_picker(LABELS[0], "man")
-    desc = st.text_input("Title / description", key="man_desc",
-                         placeholder="What was this block?")
+    desc = text_input("Title / description", key="man_desc",
+                      placeholder="What was this block?")
     label = resolve_label(sel, custom)
 
+    day = parse_date(day_raw)
     start_dt = parse_time(start_raw)
     end_dt = parse_time(end_raw)
     if start_dt and end_dt and span_seconds(start_dt, end_dt) > 0:
-        st.markdown(f"<div class='section-note'>Duration: "
-                    f"<span style='color:#f5c518'>{fmt_hm(span_seconds(start_dt, end_dt))}"
-                    f"</span></div>", unsafe_allow_html=True)
+        note(f"Duration: <span style='color:#f5c518'>"
+             f"{fmt_hm(span_seconds(start_dt, end_dt))}</span>")
 
     m1, m2 = st.columns(2)
     with m1:
-        if st.button("Add to log", use_container_width=True, key="man_save"):
-            if not start_dt or not end_dt:
-                st.warning("Start and end are required. Try formats like `09:15` or `9:15 AM`.")
+        if button("Add to log", use_container_width=True, key="man_save"):
+            if not day:
+                st.warning("Couldn't read the date. Use `YYYY-MM-DD` or `DD.MM.YYYY`.")
+            elif not start_dt or not end_dt:
+                st.warning("Start and end are required. Try `09:15` or `9:15 AM`.")
             elif span_seconds(start_dt, end_dt) <= 0:
                 st.warning("End time must be after start time. A block crossing midnight "
                            "needs to be logged as two entries.")
             elif sel == "Other" and not custom and not desc.strip():
                 st.warning("Add a custom type or a title so this entry is identifiable.")
             else:
-                add_manual_entry(
-                    day.strftime("%Y-%m-%d") if isinstance(day, date_cls) else str(day),
-                    label, desc,
-                    start_dt.strftime("%H:%M"), end_dt.strftime("%H:%M"),
-                    span_seconds(start_dt, end_dt),
-                )
+                add_manual_entry(day.strftime("%Y-%m-%d"), label, desc,
+                                 start_dt.strftime("%H:%M"), end_dt.strftime("%H:%M"),
+                                 span_seconds(start_dt, end_dt))
                 st.session_state.show_manual = False
-                st.session_state.edit_flash = ("Past block added. Fewer lost hours, "
-                                               "a truer record.")
+                st.session_state.edit_flash = "Past block added. Fewer lost hours, a truer record."
                 rerun_app()
     with m2:
-        if st.button("Cancel", use_container_width=True, key="man_cancel"):
+        if button("Cancel", use_container_width=True, key="man_cancel"):
             st.session_state.show_manual = False
             rerun_app()
 
@@ -878,18 +894,14 @@ def render_log():
         st.session_state.edit_flash = None
 
     if not acts:
-        st.markdown(
-            "<div style='color:#666;font-style:italic;padding:6px 0'>"
-            "Nothing registered yet. Start a timer above, and your blocks land here."
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("<div style='color:#666;font-style:italic;padding:6px 0'>"
+                    "Nothing registered yet. Start a timer above, and your blocks land here."
+                    "</div>", unsafe_allow_html=True)
         render_manual_entry()
         return
 
     coach_says(coach_msg("register", REGISTER_MSG))
 
-    # Totals by label (all dates combined)
     totals = {}
     grand = 0
     for a in acts:
@@ -902,11 +914,10 @@ def render_log():
             st.metric(label, fmt_hm(secs))
 
     st.markdown("")
-    result_card(f"⏱️ Total tracked: <strong>{fmt_hm(grand)}</strong> "
-                f"across <strong>{len(acts)}</strong> registered "
+    result_card(f"⏱️ Total tracked: <strong>{fmt_hm(grand)}</strong> across "
+                f"<strong>{len(acts)}</strong> registered "
                 f"{'block' if len(acts) == 1 else 'blocks'}.", "#2ecc71")
 
-    # Entry rows
     for i, a in enumerate(acts):
         desc = f" &middot; {a['description']}" if a["description"] else ""
         r1, r2, r3 = st.columns([6, 1, 1])
@@ -920,11 +931,11 @@ padding:8px 14px;margin:3px 0;font-family:'Barlow',sans-serif">
   {a['start']}&ndash;{a['end']} &nbsp; {fmt_hm(a['duration_seconds'])}</span>
 </div>""", unsafe_allow_html=True)
         with r2:
-            if st.button("✎", key=f"edit_{i}", help="Edit type, title, or times"):
+            if button("Edit", key=f"edit_{i}", help="Edit type, title, or times"):
                 open_editor(i)
                 rerun_app()
         with r3:
-            if st.button("✕", key=f"del_{i}", help="Delete this entry"):
+            if button("✕", key=f"del_{i}", help="Delete this entry"):
                 delete_entry(i)
                 close_editors()
                 rerun_app()
@@ -932,62 +943,57 @@ padding:8px 14px;margin:3px 0;font-family:'Barlow',sans-serif">
         # ── Inline editor for this saved entry ──
         if st.session_state.editing_idx == i:
             token = st.session_state.edit_token
-            st.markdown('<div class="edit-panel-title">✎ EDIT ENTRY</div>'
+            st.markdown('<div class="edit-panel-title">EDIT ENTRY</div>'
                         '<div class="edit-panel-sub">Type, title, and times are all '
                         'editable. Duration recalculates from start and end.</div>',
                         unsafe_allow_html=True)
             sel, custom = type_picker(a["label"], f"logedit_{i}_{token}")
-            new_desc = st.text_input("Title / description",
-                                     value=a.get("description", ""),
-                                     key=f"logedit_{i}_{token}_desc",
-                                     placeholder="What was this block really about?")
+            new_desc = text_input("Title / description", value=a.get("description", ""),
+                                  key=f"logedit_{i}_{token}_desc",
+                                  placeholder="What was this block really about?")
             t1, t2, t3 = st.columns([2, 1, 1])
             with t1:
-                try:
-                    day_default = datetime.strptime(a["date"], "%Y-%m-%d").date()
-                except Exception:
-                    day_default = real_now().date()
-                new_day = st.date_input("Date", value=day_default,
-                                        key=f"logedit_{i}_{token}_date")
+                new_day_raw = text_input("Date", value=a["date"],
+                                         key=f"logedit_{i}_{token}_date",
+                                         placeholder="YYYY-MM-DD")
             with t2:
-                new_start = st.text_input("Start", value=a["start"],
-                                          key=f"logedit_{i}_{token}_start")
+                new_start = text_input("Start", value=a["start"],
+                                       key=f"logedit_{i}_{token}_start")
             with t3:
-                new_end = st.text_input("End", value=a["end"],
-                                        key=f"logedit_{i}_{token}_end")
+                new_end = text_input("End", value=a["end"],
+                                     key=f"logedit_{i}_{token}_end")
 
             new_label = resolve_label(sel, custom)
+            new_day = parse_date(new_day_raw)
             s_dt, e_dt = parse_time(new_start), parse_time(new_end)
             if s_dt and e_dt and span_seconds(s_dt, e_dt) > 0:
-                st.markdown(f"<div class='section-note'>New duration: "
-                            f"<span style='color:#f5c518'>{fmt_hm(span_seconds(s_dt, e_dt))}"
-                            f"</span> (was {fmt_hm(a['duration_seconds'])})</div>",
-                            unsafe_allow_html=True)
+                note(f"New duration: <span style='color:#f5c518'>"
+                     f"{fmt_hm(span_seconds(s_dt, e_dt))}</span> "
+                     f"(was {fmt_hm(a['duration_seconds'])})")
 
             e1, e2 = st.columns(2)
             with e1:
-                if st.button("Save changes", use_container_width=True,
-                             key=f"logedit_{i}_{token}_save"):
-                    if not s_dt or not e_dt:
+                if button("Save changes", use_container_width=True,
+                          key=f"logedit_{i}_{token}_save"):
+                    if not new_day:
+                        st.warning("Couldn't read the date. Use `YYYY-MM-DD`.")
+                    elif not s_dt or not e_dt:
                         st.warning("Couldn't read the times. Try `09:15` or `9:15 AM`.")
                     elif span_seconds(s_dt, e_dt) <= 0:
                         st.warning("End time must be after start time.")
                     elif sel == "Other" and not custom and not new_desc.strip():
                         st.warning("Add a custom type or a title so this entry stays identifiable.")
                     else:
-                        update_entry(
-                            i, new_label, new_desc,
-                            new_day.strftime("%Y-%m-%d") if isinstance(new_day, date_cls)
-                            else str(new_day),
-                            s_dt.strftime("%H:%M"), e_dt.strftime("%H:%M"),
-                            span_seconds(s_dt, e_dt),
-                        )
+                        update_entry(i, new_label, new_desc,
+                                     new_day.strftime("%Y-%m-%d"),
+                                     s_dt.strftime("%H:%M"), e_dt.strftime("%H:%M"),
+                                     span_seconds(s_dt, e_dt))
                         close_editors()
                         st.session_state.edit_flash = random.choice(RELABEL_MSG)
                         rerun_app()
             with e2:
-                if st.button("Cancel", use_container_width=True,
-                             key=f"logedit_{i}_{token}_cancel"):
+                if button("Cancel", use_container_width=True,
+                          key=f"logedit_{i}_{token}_cancel"):
                     close_editors()
                     rerun_app()
             st.markdown("<hr>", unsafe_allow_html=True)
@@ -996,7 +1002,6 @@ padding:8px 14px;margin:3px 0;font-family:'Barlow',sans-serif">
     render_manual_entry()
     st.markdown("---")
 
-    # Copy / paste area
     summary = build_summary_text()
     st.markdown("#### 📤 Copy, Download, or Email")
     st.caption("Select all in the box below to copy your hours, or use the buttons.")
@@ -1005,30 +1010,23 @@ padding:8px 14px;margin:3px 0;font-family:'Barlow',sans-serif">
 
     d1, d2, d3 = st.columns(3)
     with d1:
-        st.download_button(
-            "⬇  CSV",
-            data=build_csv_bytes(),
-            file_name=f"workday_{real_now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        st.download_button("⬇  CSV", data=build_csv_bytes(),
+                           file_name=f"workday_{real_now().strftime('%Y%m%d_%H%M')}.csv",
+                           mime="text/csv", use_container_width=True)
     with d2:
-        st.download_button(
-            "⬇  TXT",
-            data=summary.encode("utf-8"),
-            file_name=f"workday_{real_now().strftime('%Y%m%d_%H%M')}.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
+        st.download_button("⬇  TXT", data=summary.encode("utf-8"),
+                           file_name=f"workday_{real_now().strftime('%Y%m%d_%H%M')}.txt",
+                           mime="text/plain", use_container_width=True)
     with d3:
-        if st.button("✉  Email backup", use_container_width=True):
+        if button("✉  Email backup", use_container_width=True, key="email_backup"):
             ok, info = send_backup_email()
             (st.success if ok else st.warning)(info)
 
     if not email_configured():
         with st.expander("How to enable email backup"):
             st.markdown(
-                "Create a file `.streamlit/secrets.toml` next to this app with:\n\n"
+                "Add these secrets to the app (Streamlit Cloud: **Manage app → Settings → "
+                "Secrets**; locally: `.streamlit/secrets.toml`):\n\n"
                 "```toml\n"
                 "[email]\n"
                 "sender = \"you@gmail.com\"\n"
@@ -1037,26 +1035,25 @@ padding:8px 14px;margin:3px 0;font-family:'Barlow',sans-serif">
                 "smtp_port = 587\n"
                 "recipient = \"you@example.com\"\n"
                 "```\n\n"
-                "For Gmail, generate an App Password (not your normal password). "
-                "On Streamlit Cloud, paste the same block into the app's Secrets settings."
+                "For Gmail, generate an App Password rather than using your normal one."
             )
 
     st.markdown("")
-    if st.button("🧹  Clear all registered activities"):
+    if button("🧹  Clear all registered activities", key="clear_all"):
         close_editors()
         st.session_state.confirm = "clear"
         rerun_app()
 
     if st.session_state.confirm == "clear":
-        st.warning("Clear the entire log? Download or email a backup first if you need it.")
+        st.warning("Clear the entire log? Download a copy first if you need it.")
         cc1, cc2 = st.columns(2)
         with cc1:
-            if st.button("Yes, clear everything", use_container_width=True):
+            if button("Yes, clear everything", use_container_width=True, key="conf_clr_yes"):
                 clear_log()
                 st.session_state.confirm = None
                 rerun_app()
         with cc2:
-            if st.button("Keep my log", use_container_width=True):
+            if button("Keep my log", use_container_width=True, key="conf_clr_no"):
                 st.session_state.confirm = None
                 rerun_app()
 
@@ -1064,9 +1061,8 @@ padding:8px 14px;margin:3px 0;font-family:'Barlow',sans-serif">
 def render_reconciliation(presence_seconds: float):
     tracked = tracked_today_seconds()
     if tracked <= 0:
-        st.markdown("<div class='section-note'>Nothing tracked today yet. Once you register "
-                    "blocks, this section compares them against your presence time.</div>",
-                    unsafe_allow_html=True)
+        note("Nothing tracked today yet. Once you register blocks, this section compares "
+             "them against your presence time.")
         return
 
     presence = max(presence_seconds, 0.0)
@@ -1094,24 +1090,22 @@ def render_reconciliation(presence_seconds: float):
             st.metric("Difference", fmt_hm(abs(gap)))
 
     if gap > RECONCILE_TOLERANCE:
-        result_card(
-            f"<strong>{fmt_hm(gap)}</strong> of your day isn't in any block yet. That's the "
-            f"part you'd otherwise reconstruct from memory at month end. Use "
-            f"<em>Log a past block</em> above to fill it in while you still remember.",
-            "#e67e22")
+        result_card(f"<strong>{fmt_hm(gap)}</strong> of your day isn't in any block yet. "
+                    f"That's the part you'd otherwise reconstruct from memory at month end. "
+                    f"Use <em>Log a past block</em> above to fill it in while you still "
+                    f"remember.", "#e67e22")
     elif gap < -RECONCILE_TOLERANCE:
-        result_card(
-            f"You've tracked <strong>{fmt_hm(-gap)}</strong> more than your presence time. "
-            f"Check for overlapping blocks, a timer left running, or an entry time that "
-            f"needs correcting.",
-            "#f5c518")
+        result_card(f"You've tracked <strong>{fmt_hm(-gap)}</strong> more than your presence "
+                    f"time. Check for overlapping blocks, a timer left running, or an entry "
+                    f"time that needs correcting.", "#f5c518")
     else:
         result_card("✅ Blocks and presence time line up. This day is timesheet-ready.",
                     "#2ecc71")
 
-# ─── CALCULATOR LOGIC ───────────────────────────────────────────────────────
+# ─── CALCULATOR ─────────────────────────────────────────────────────────────
 def get_now() -> datetime:
-    n = datetime.now(TZ)
+    """Naive 'today at 1900-01-01' clock, so it can be compared with parsed times."""
+    n = real_now()
     return n.replace(tzinfo=None, year=1900, month=1, day=1)
 
 def run_calculator(entry, start_lunch, end_lunch, leave, now):
@@ -1142,15 +1136,13 @@ def run_calculator(entry, start_lunch, end_lunch, leave, now):
         if worked >= WORKDAY:
             extra = (" Banked <strong>" + fmt_td(-deficit) + "</strong> extra, nice work."
                      if deficit.total_seconds() < 0 else " Right on target.")
-            result_card(f"✅ Full day done. You worked <strong>{fmt_td(worked)}</strong>.{extra}",
-                        "#2ecc71")
+            result_card(f"✅ Full day done. You worked <strong>{fmt_td(worked)}</strong>."
+                        f"{extra}", "#2ecc71")
             coach_says(coach_msg("calc_final", FINAL_MSG))
         else:
-            result_card(
-                f"You worked <strong>{fmt_td(worked)}</strong> of 8h 00m, "
-                f"<strong style='color:#e67e22'>{fmt_td(deficit)} to go</strong>. "
-                f"No pressure, balance it tomorrow.",
-                "#e67e22")
+            result_card(f"You worked <strong>{fmt_td(worked)}</strong> of 8h 00m, "
+                        f"<strong style='color:#e67e22'>{fmt_td(deficit)} to go</strong>. "
+                        f"No pressure, balance it tomorrow.", "#e67e22")
             coach_says(coach_msg("calc_short", SHORT_MSG))
 
     elif end_lunch and start_lunch:
@@ -1210,12 +1202,12 @@ def run_calculator(entry, start_lunch, end_lunch, leave, now):
         c1, c2 = st.columns(2)
         with c1:
             time_badge("30-min lunch", leave_30)
-            st.markdown("<div style='color:#777;font-size:0.8rem;text-align:center'>Leave at ↑</div>",
-                        unsafe_allow_html=True)
+            st.markdown("<div style='color:#777;font-size:0.8rem;text-align:center'>"
+                        "Leave at ↑</div>", unsafe_allow_html=True)
         with c2:
             time_badge("1-hour lunch", leave_60)
-            st.markdown("<div style='color:#777;font-size:0.8rem;text-align:center'>Leave at ↑</div>",
-                        unsafe_allow_html=True)
+            st.markdown("<div style='color:#777;font-size:0.8rem;text-align:center'>"
+                        "Leave at ↑</div>", unsafe_allow_html=True)
 
     else:
         worked_now = max(now - entry, timedelta(0))
@@ -1247,25 +1239,35 @@ def run_calculator(entry, start_lunch, end_lunch, leave, now):
         c1, c2 = st.columns(2)
         with c1:
             time_badge("30-min lunch", leave_30)
-            st.markdown("<div style='color:#777;font-size:0.8rem;text-align:center'>Leave at ↑</div>",
-                        unsafe_allow_html=True)
+            st.markdown("<div style='color:#777;font-size:0.8rem;text-align:center'>"
+                        "Leave at ↑</div>", unsafe_allow_html=True)
         with c2:
             time_badge("1-hour lunch", leave_60)
-            st.markdown("<div style='color:#777;font-size:0.8rem;text-align:center'>Leave at ↑</div>",
-                        unsafe_allow_html=True)
+            st.markdown("<div style='color:#777;font-size:0.8rem;text-align:center'>"
+                        "Leave at ↑</div>", unsafe_allow_html=True)
 
     st.markdown("---")
     render_reconciliation(presence)
 
 def calculator_body(entry, start_lunch, end_lunch, leave):
-    """Fragment target, so the live countdown refreshes without redrawing the page."""
     run_calculator(entry, start_lunch, end_lunch, leave, get_now())
+
+# ─── FRAGMENTS ARE BUILT ONCE, NOT PER RERUN ────────────────────────────────
+# Re-applying the decorator on every script run would register a new fragment
+# (and a new auto-refresh schedule) each time, which compounds into a refresh
+# storm that looks like an app stuck loading.
+if HAS_FRAGMENT:
+    live_card_auto = _FRAG(run_every="1s")(live_activity_card)
+    calculator_auto = _FRAG(run_every="30s")(calculator_body)
+else:
+    live_card_auto = live_activity_card
+    calculator_auto = calculator_body
 
 def render_calculator():
     st.markdown("### 🧮 Workday Calculator")
 
-    # Apply a queued value before the widget is instantiated. Assigning to a
-    # widget key after its widget has rendered would raise in Streamlit.
+    # Apply a queued value before the widget exists. Assigning to a widget key
+    # after its widget has rendered would raise.
     if st.session_state.get("_pending_entry") is not None:
         st.session_state.calc_entry = st.session_state.pop("_pending_entry")
 
@@ -1275,21 +1277,21 @@ def render_calculator():
 
     col_a, col_b = st.columns(2)
     with col_a:
-        entry_raw = st.text_input("🕐 Entry time", key="calc_entry",
-                                  placeholder="08:30  /  8:30 AM  /  08:30:00")
-        end_lunch_raw = st.text_input("🍽️ Lunch end (optional)", key="calc_lunch_end",
-                                      placeholder="13:00")
+        entry_raw = text_input("🕐 Entry time", key="calc_entry",
+                               placeholder="08:30  /  8:30 AM  /  08:30:00")
+        end_lunch_raw = text_input("🍽️ Lunch end (optional)", key="calc_lunch_end",
+                                   placeholder="13:00")
     with col_b:
-        start_lunch_raw = st.text_input("🌿 Lunch start (optional)", key="calc_lunch_start",
-                                        placeholder="12:15")
-        leave_raw = st.text_input("🚪 Actual leave (optional)", key="calc_leave",
-                                  placeholder="17:45")
+        start_lunch_raw = text_input("🌿 Lunch start (optional)", key="calc_lunch_start",
+                                     placeholder="12:15")
+        leave_raw = text_input("🚪 Actual leave (optional)", key="calc_leave",
+                               placeholder="17:45")
 
     if suggestion and (entry_raw or "").strip() != suggestion:
         s1, _ = st.columns([2, 3])
         with s1:
-            if st.button(f"Use first tracked block ({suggestion})",
-                         use_container_width=True, key="use_suggested_entry"):
+            if button(f"Use first tracked block ({suggestion})",
+                      use_container_width=True, key="use_suggested_entry"):
                 st.session_state["_pending_entry"] = suggestion
                 rerun_app()
 
@@ -1298,7 +1300,7 @@ def render_calculator():
     end_lunch = parse_time(end_lunch_raw)
     leave = parse_time(leave_raw)
 
-    bad = [(lbl, raw) for lbl, raw, val in [
+    bad = [lbl for lbl, raw, val in [
         ("Entry", entry_raw, entry),
         ("Lunch start", start_lunch_raw, start_lunch),
         ("Lunch end", end_lunch_raw, end_lunch),
@@ -1306,51 +1308,36 @@ def render_calculator():
     ] if raw and raw.strip() and val is None]
 
     if bad:
-        fields = ", ".join(f[0] for f in bad)
-        st.error(f"Couldn't read: **{fields}**. "
+        st.error(f"Couldn't read: **{', '.join(bad)}**. "
                  f"Try formats like `08:30`, `8:30`, `08:30:00`, or `8:30 AM`.")
     elif not entry:
-        st.markdown(
-            "<div style='text-align:center;padding:20px 0;color:#555;"
-            "font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px'>"
-            "Drop your entry time above and we'll map out your finish line."
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("<div style='text-align:center;padding:20px 0;color:#555;"
+                    "font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px'>"
+                    "Drop your entry time above and we'll map out your finish line."
+                    "</div>", unsafe_allow_html=True)
     else:
-        live = not leave
-        if live and HAS_FRAGMENT:
-            as_fragment(calculator_body, "30s")(entry, start_lunch, end_lunch, leave)
+        if (not leave) and HAS_FRAGMENT:
+            calculator_auto(entry, start_lunch, end_lunch, leave)
         else:
             calculator_body(entry, start_lunch, end_lunch, leave)
-
-    return entry, leave, bad
+            if not leave:
+                if button("⟳  Refresh totals", key="calc_tick"):
+                    rerun_app()
 
 # ─── PAGE ───────────────────────────────────────────────────────────────────
 st.markdown("<h1>⏱️ WORKDAY TRACKER</h1>", unsafe_allow_html=True)
-st.markdown(
-    "<p style='text-align:center;color:#8a8170;font-style:italic;font-size:0.95rem;"
-    "font-family:Barlow,sans-serif;margin-top:0'>"
-    "Track your focus, capture your hours, finish strong.</p>",
-    unsafe_allow_html=True,
-)
-st.markdown("---")
+st.markdown("<p style='text-align:center;color:#8a8170;font-style:italic;font-size:0.95rem;"
+            "font-family:Barlow,sans-serif;margin-top:0'>"
+            "Track your focus, capture your hours, finish strong.</p>",
+            unsafe_allow_html=True)
 
+st.markdown("<div class='session-warning'><strong>This session only.</strong> Nothing is "
+            "written to disk, so your log lives in this browser tab. Reloading the page or "
+            "letting the app go idle clears it. Download the CSV or TXT before you finish "
+            "for the day.</div>", unsafe_allow_html=True)
+
+st.markdown("---")
 render_timer()
 render_log()
-
 st.markdown("---")
-entry, leave, bad = render_calculator()
-
-# ─── LEGACY AUTO-REFRESH FALLBACK ───────────────────────────────────────────
-# Only used on Streamlit versions without fragments. With fragments, the clock
-# and the calculator refresh themselves in isolation and the page stays still.
-if not HAS_FRAGMENT and not editors_open() and not st.session_state.show_manual:
-    timer_running = bool(st.session_state.active and st.session_state.active.get("running"))
-    calc_live = bool(entry and not leave and not bad)
-    if timer_running:
-        time.sleep(1)
-        st.rerun()
-    elif calc_live:
-        time.sleep(30)
-        st.rerun()
+render_calculator()
