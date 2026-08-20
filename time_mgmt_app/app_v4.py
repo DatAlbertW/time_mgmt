@@ -1,20 +1,40 @@
 """
 WORKDAY TRACKER
 ===============
-Single-file Streamlit app. No requirements.txt needed, no files written to disk.
+Single-file Streamlit app. Stdlib only, no requirements.txt needed.
 
-Design constraints this version respects:
-  * Stdlib only. The sole third-party import is streamlit itself.
-  * Nothing is read from or written to the filesystem. All state lives in
-    st.session_state, so the app behaves identically on Streamlit Community
-    Cloud, where the container filesystem is ephemeral and shared.
-  * No blocking sleep/rerun loop, ever. Older Streamlit versions simply get a
-    manual refresh button instead of a live clock. The app can therefore never
-    sit in a permanent "loading" state because of this code.
-  * Every newer Streamlit API is feature-detected before use.
+PERSISTENCE MODEL
+-----------------
+The timer is stored as a TIMESTAMP, never as a counter. Elapsed time is always
+recomputed as (now - started_at), so the clock keeps advancing while the app is
+closed, your laptop is off, or you are on a different device. Nothing has to be
+"running" anywhere for time to accrue.
 
-Because there is no persistence, a browser refresh clears the log. Use the
-CSV/TXT download buttons before closing the tab.
+State is written to durable storage after every change, and read back whenever a
+session starts or goes stale. Three backends, chosen automatically:
+
+  1. GitHub Gist  (survives everything: reboots, device switches, container
+                   recycles, redeploys)  -> needs secrets, see SETUP below
+  2. Local file   (survives browser refresh, tab close, and computer restart
+                   when run locally; on Streamlit Cloud it survives until the
+                   container is recycled)
+  3. Session only (last resort, warns loudly)
+
+Nothing resets on its own. The log clears only when you press the reset button
+and confirm.
+
+SETUP for full cross-device sync
+--------------------------------
+Create a secret gist at https://gist.github.com with any placeholder content and
+note its id from the URL. Create a fine-grained token with Gist read/write at
+https://github.com/settings/tokens. Then add to Streamlit secrets
+(Manage app -> Settings -> Secrets, or .streamlit/secrets.toml locally):
+
+    [storage]
+    github_token = "github_pat_..."
+    gist_id = "abc123..."
+
+Open the same app URL on any device and your timer is there, still counting.
 """
 
 import streamlit as st
@@ -22,8 +42,12 @@ from datetime import datetime, timedelta
 import csv
 import inspect
 import io
+import json
+import os
 import random
 import smtplib
+import urllib.error
+import urllib.request
 from email.message import EmailMessage
 
 st.set_page_config(
@@ -36,11 +60,11 @@ WORKDAY = timedelta(hours=8)
 LABELS = ["Meeting", "Jira", "Training", "Other"]
 RECONCILE_TOLERANCE = 15 * 60           # seconds of gap treated as "close enough"
 STALE_TIMER_SECONDS = 12 * 3600         # flag timers that look forgotten
+RESYNC_AFTER_SECONDS = 90               # re-read storage if state is older than this
+DATA_VERSION = 1
+LOCAL_DIR = os.path.join(os.getcwd(), ".workday_data")
 
 # ─── CAPABILITY DETECTION ───────────────────────────────────────────────────
-# Everything below is checked at import time so no call site has to guess what
-# the installed Streamlit version supports.
-
 def _tz():
     """Europe/Zurich if the tz database is available, otherwise machine local."""
     try:
@@ -88,6 +112,307 @@ def text_input(label, **kwargs):
     except TypeError:
         kwargs.pop("placeholder", None)
         return st.text_input(label, **kwargs)
+
+def read_query_param(name):
+    """Read one query param across old and new Streamlit APIs."""
+    try:
+        val = st.query_params.get(name)
+        if isinstance(val, list):
+            val = val[0] if val else None
+        if val:
+            return val
+    except Exception:
+        pass
+    try:
+        vals = st.experimental_get_query_params().get(name)
+        if vals:
+            return vals[0]
+    except Exception:
+        pass
+    return None
+
+# Same URL on every device means the same log. Add ?u=someone to keep a
+# separate log, which is only useful if you share the app.
+USER_ID = (read_query_param("u") or "default").strip()[:40] or "default"
+
+# ─── TIME HELPERS ───────────────────────────────────────────────────────────
+def real_now() -> datetime:
+    if TZ is not None:
+        return datetime.now(TZ)
+    return datetime.now().astimezone()
+
+def today_str() -> str:
+    return real_now().strftime("%Y-%m-%d")
+
+def to_iso(dt):
+    return dt.isoformat() if isinstance(dt, datetime) else None
+
+def from_iso(txt):
+    if not txt:
+        return None
+    try:
+        dt = datetime.fromisoformat(txt)
+    except Exception:
+        return None
+    # Stored values are timezone-aware. Attach the current zone if an old
+    # naive value shows up, so subtraction never raises.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=real_now().tzinfo)
+    return dt
+
+def fmt_clock(seconds: float) -> str:
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}"
+
+def fmt_hm(seconds: float) -> str:
+    s = int(abs(seconds))
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    return f"{h}h {m:02d}m"
+
+def fmt_td(td: timedelta) -> str:
+    return fmt_hm(td.total_seconds())
+
+def parse_time(raw: str):
+    """Accept 08:30, 8:30, 08:30:00, 8:30 AM, 8.30 and friends."""
+    if not raw or not raw.strip():
+        return None
+    s = raw.strip().upper()
+    for fmt in ("%H:%M:%S", "%H:%M", "%I:%M:%S %p", "%I:%M %p",
+                "%I:%M%p", "%H.%M.%S", "%H.%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+def parse_date(raw: str):
+    if not raw or not raw.strip():
+        return None
+    s = raw.strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+def span_seconds(start_dt: datetime, end_dt: datetime) -> int:
+    return int((end_dt - start_dt).total_seconds())
+
+def pct_color(p: float) -> str:
+    if p >= 1.0:
+        return "#2ecc71"
+    if p >= 0.6:
+        return "#f5c518"
+    return "#e67e22"
+
+# ─── STORAGE BACKENDS ───────────────────────────────────────────────────────
+class MemoryStore:
+    """No durability. Only used when everything else is unavailable."""
+    key = "memory"
+    label = "Session only"
+    durable = False
+    detail = ("Nothing is being saved outside this browser tab. Add gist secrets "
+              "for cross-device sync, or run the app locally for file storage.")
+
+    def load(self, user):
+        return None, None
+
+    def save(self, user, payload):
+        return True, None
+
+
+class FileStore:
+    """JSON on the machine running Streamlit."""
+    key = "file"
+    label = "Local file"
+    durable = True
+    detail = ("Saved to a file next to the app. This survives browser refreshes, "
+              "closing the tab, and restarting your computer when you run the app "
+              "locally. On Streamlit Cloud it is lost when the container recycles, "
+              "so add gist secrets for true cross-device safety.")
+
+    def _path(self, user):
+        return os.path.join(LOCAL_DIR, f"{user}.json")
+
+    def load(self, user):
+        try:
+            path = self._path(user)
+            if not os.path.exists(path):
+                return None, None
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f), None
+        except Exception as e:
+            return None, f"Could not read local file: {e}"
+
+    def save(self, user, payload):
+        try:
+            os.makedirs(LOCAL_DIR, exist_ok=True)
+            tmp = self._path(user) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._path(user))    # atomic, never a half-written file
+            return True, None
+        except Exception as e:
+            return False, f"Could not write local file: {e}"
+
+
+class GistStore:
+    """A private GitHub gist as a tiny key-value store. Stdlib HTTP only."""
+    key = "gist"
+    label = "GitHub Gist"
+    durable = True
+    detail = ("Saved to your private gist. Your timer survives reboots, redeploys, "
+              "and device switches. Open this same URL anywhere to pick it up.")
+
+    API = "https://api.github.com/gists/"
+
+    def __init__(self, token, gist_id):
+        self.token = token
+        self.gist_id = gist_id
+
+    def _filename(self, user):
+        return f"workday_{user}.json"
+
+    def _request(self, method, payload=None, url=None):
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(url or (self.API + self.gist_id),
+                                     data=data, method=method)
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("User-Agent", "workday-tracker")
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            body = resp.read().decode("utf-8")
+        return json.loads(body) if body else {}
+
+    def load(self, user):
+        try:
+            gist = self._request("GET")
+            entry = (gist.get("files") or {}).get(self._filename(user))
+            if not entry:
+                return None, None
+            content = entry.get("content")
+            if entry.get("truncated") and entry.get("raw_url"):
+                with urllib.request.urlopen(entry["raw_url"], timeout=12) as r:
+                    content = r.read().decode("utf-8")
+            if not content:
+                return None, None
+            return json.loads(content), None
+        except urllib.error.HTTPError as e:
+            return None, f"Gist read failed ({e.code}). Check the token and gist id."
+        except Exception as e:
+            return None, f"Gist read failed: {e}"
+
+    def save(self, user, payload):
+        try:
+            body = {"files": {self._filename(user): {
+                "content": json.dumps(payload, ensure_ascii=False, indent=2)}}}
+            self._request("PATCH", body)
+            return True, None
+        except urllib.error.HTTPError as e:
+            return False, f"Gist write failed ({e.code}). Does the token have gist scope?"
+        except Exception as e:
+            return False, f"Gist write failed: {e}"
+
+
+def _build_store():
+    """Pick the most durable backend available. Never raises."""
+    try:
+        cfg = st.secrets["storage"]
+        token, gist_id = cfg.get("github_token"), cfg.get("gist_id")
+        if token and gist_id:
+            return GistStore(token, gist_id)
+    except Exception:
+        pass
+    try:
+        os.makedirs(LOCAL_DIR, exist_ok=True)
+        probe = os.path.join(LOCAL_DIR, ".probe")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return FileStore()
+    except Exception:
+        return MemoryStore()
+
+STORE = _build_store()
+
+# ─── SERIALISATION ──────────────────────────────────────────────────────────
+def serialise_state():
+    a = st.session_state.active
+    active = None
+    if a:
+        active = dict(a)
+        active["created_at"] = to_iso(a.get("created_at"))
+        active["started_at"] = to_iso(a.get("started_at"))
+    return {
+        "version": DATA_VERSION,
+        "saved_at": to_iso(real_now()),
+        "activities": st.session_state.activities,
+        "active": active,
+    }
+
+def apply_loaded(data):
+    """Replace in-memory state with what storage holds."""
+    if not isinstance(data, dict):
+        return
+    st.session_state.activities = data.get("activities") or []
+    a = data.get("active")
+    if a:
+        a = dict(a)
+        a["created_at"] = from_iso(a.get("created_at"))
+        a["started_at"] = from_iso(a.get("started_at"))
+        # A record with no usable start timestamp is unusable, drop it rather
+        # than crash later on subtraction.
+        if a.get("started_at") is None:
+            a = None
+    st.session_state.active = a
+    st.session_state.last_sync = real_now()
+
+def persist():
+    """Write current state. Called after every mutation, never on a clock tick."""
+    ok, err = STORE.save(USER_ID, serialise_state())
+    st.session_state.store_error = err
+    if ok:
+        st.session_state.last_saved = real_now()
+    return ok
+
+def pull(force=False):
+    """Read storage into state if this session has never loaded, or is stale."""
+    if not STORE.durable:
+        return
+    last = st.session_state.get("last_sync")
+    if not force and last is not None:
+        if (real_now() - last).total_seconds() < RESYNC_AFTER_SECONDS:
+            return
+    data, err = STORE.load(USER_ID)
+    st.session_state.store_error = err
+    if data is not None:
+        apply_loaded(data)
+    else:
+        st.session_state.last_sync = real_now()
+
+# ─── SESSION STATE ──────────────────────────────────────────────────────────
+st.session_state.setdefault("activities", [])
+st.session_state.setdefault("active", None)
+st.session_state.setdefault("confirm", None)
+st.session_state.setdefault("editing_active", False)
+st.session_state.setdefault("editing_idx", None)
+st.session_state.setdefault("edit_token", "0")
+st.session_state.setdefault("edit_flash", None)
+st.session_state.setdefault("show_manual", False)
+st.session_state.setdefault("coach_msgs", {})
+st.session_state.setdefault("last_sync", None)
+st.session_state.setdefault("last_saved", None)
+st.session_state.setdefault("store_error", None)
+
+# First contact with storage happens before anything renders, so a fresh
+# browser on a fresh device immediately sees the running timer.
+pull()
 
 # ─── THEME ──────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -245,10 +570,11 @@ hr {
     color: #6f6a60; font-size: 0.8rem; font-family: 'Barlow', sans-serif;
     margin: 2px 0 8px 0;
 }
-.session-warning {
-    background: #161616; border: 1px solid #3a2f14; border-left: 4px solid #f5c518;
-    border-radius: 0 8px 8px 0; padding: 10px 16px; margin: 6px 0 14px 0;
-    color: #b9ad97; font-size: 0.85rem; font-family: 'Barlow', sans-serif;
+.store-bar {
+    display: flex; justify-content: space-between; align-items: center;
+    background: #141414; border: 1px solid #262626; border-radius: 8px;
+    padding: 7px 14px; margin: 4px 0 10px 0;
+    font-family: 'Share Tech Mono', monospace; font-size: 0.75rem; color: #6f6a60;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -316,86 +642,26 @@ def refresh_coach(*keys):
     for k in keys:
         store.pop(k, None)
 
-# ─── SESSION STATE (the only storage this app has) ──────────────────────────
-st.session_state.setdefault("activities", [])       # registered blocks
-st.session_state.setdefault("active", None)         # running/paused block
-st.session_state.setdefault("confirm", None)        # pending confirmation key
-st.session_state.setdefault("editing_active", False)
-st.session_state.setdefault("editing_idx", None)
-st.session_state.setdefault("edit_token", "0")
-st.session_state.setdefault("edit_flash", None)
-st.session_state.setdefault("show_manual", False)
-st.session_state.setdefault("coach_msgs", {})
-
-# ─── TIME HELPERS ───────────────────────────────────────────────────────────
-def real_now() -> datetime:
-    if TZ is not None:
-        return datetime.now(TZ)
-    return datetime.now().astimezone()
-
-def today_str() -> str:
-    return real_now().strftime("%Y-%m-%d")
+# ─── TIMER MODEL ────────────────────────────────────────────────────────────
+# active = {
+#   label, description,
+#   created_at   : when this block was first started (used for the log's start)
+#   started_at   : when the CURRENT running stretch began, or None while paused
+#   accumulated  : seconds banked by previous stretches
+#   running      : bool
+# }
+# Elapsed is always accumulated + (now - started_at). Nothing decays if the app
+# is closed, because started_at is an absolute wall-clock time in storage.
 
 def active_elapsed() -> float:
-    """Seconds on the active timer, running or paused."""
     a = st.session_state.active
     if not a:
         return 0.0
     secs = float(a.get("accumulated", 0.0))
-    if a.get("running") and a.get("resumed_at"):
-        secs += (real_now() - a["resumed_at"]).total_seconds()
+    if a.get("running") and a.get("started_at"):
+        secs += (real_now() - a["started_at"]).total_seconds()
     return max(secs, 0.0)
 
-def fmt_clock(seconds: float) -> str:
-    s = int(seconds)
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{sec:02d}"
-
-def fmt_hm(seconds: float) -> str:
-    s = int(abs(seconds))
-    h, rem = divmod(s, 3600)
-    m = rem // 60
-    return f"{h}h {m:02d}m"
-
-def fmt_td(td: timedelta) -> str:
-    return fmt_hm(td.total_seconds())
-
-def parse_time(raw: str):
-    """Accept 08:30, 8:30, 08:30:00, 8:30 AM, 8.30 and friends."""
-    if not raw or not raw.strip():
-        return None
-    s = raw.strip().upper()
-    for fmt in ("%H:%M:%S", "%H:%M", "%I:%M:%S %p", "%I:%M %p",
-                "%I:%M%p", "%H.%M.%S", "%H.%M"):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    return None
-
-def parse_date(raw: str):
-    if not raw or not raw.strip():
-        return None
-    s = raw.strip()
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            continue
-    return None
-
-def span_seconds(start_dt: datetime, end_dt: datetime) -> int:
-    return int((end_dt - start_dt).total_seconds())
-
-def pct_color(p: float) -> str:
-    if p >= 1.0:
-        return "#2ecc71"
-    if p >= 0.6:
-        return "#f5c518"
-    return "#e67e22"
-
-# ─── TIMER ACTIONS ──────────────────────────────────────────────────────────
 def sort_activities():
     st.session_state.activities.sort(key=lambda a: (a.get("date", ""), a.get("start", "")))
 
@@ -406,31 +672,34 @@ def start_activity(label: str, description: str):
         "description": description.strip(),
         "accumulated": 0.0,
         "running": True,
-        "resumed_at": now,      # datetime objects are fine, nothing is serialised
+        "started_at": now,
         "created_at": now,
     }
     refresh_coach("timer_start")
+    persist()
 
 def pause_activity():
     a = st.session_state.active
-    if a and a.get("running") and a.get("resumed_at"):
+    if a and a.get("running") and a.get("started_at"):
         a["accumulated"] = float(a.get("accumulated", 0.0)) + \
-            (real_now() - a["resumed_at"]).total_seconds()
+            (real_now() - a["started_at"]).total_seconds()
         a["running"] = False
-        a["resumed_at"] = None
+        a["started_at"] = None
+        persist()
 
 def resume_activity():
     a = st.session_state.active
     if a and not a.get("running"):
-        a["resumed_at"] = real_now()
+        a["started_at"] = real_now()
         a["running"] = True
+        persist()
 
 def register_activity():
     a = st.session_state.active
     if not a:
         return
     duration = active_elapsed()
-    start_dt = a["created_at"]
+    start_dt = a.get("created_at") or real_now()
     end_dt = real_now()
     st.session_state.activities.append({
         "date": start_dt.strftime("%Y-%m-%d"),
@@ -443,10 +712,12 @@ def register_activity():
     sort_activities()
     st.session_state.active = None
     refresh_coach("register", "timer_start")
+    persist()
 
 def discard_activity():
     st.session_state.active = None
     refresh_coach("timer_start")
+    persist()
 
 def add_manual_entry(day, label, description, start_txt, end_txt, duration_seconds):
     st.session_state.activities.append({
@@ -459,13 +730,22 @@ def add_manual_entry(day, label, description, start_txt, end_txt, duration_secon
     })
     sort_activities()
     refresh_coach("register")
+    persist()
 
 def delete_entry(idx: int):
     if 0 <= idx < len(st.session_state.activities):
         st.session_state.activities.pop(idx)
+        persist()
 
 def clear_log():
     st.session_state.activities = []
+    persist()
+
+def reset_everything():
+    st.session_state.activities = []
+    st.session_state.active = None
+    st.session_state.coach_msgs = {}
+    persist()
 
 # ─── EDIT HELPERS ───────────────────────────────────────────────────────────
 def open_editor(target):
@@ -486,6 +766,7 @@ def update_active_meta(label: str, description: str):
     if a:
         a["label"] = label
         a["description"] = description.strip()
+        persist()
 
 def update_entry(idx, label, description, day, start_txt, end_txt, duration_seconds):
     if 0 <= idx < len(st.session_state.activities):
@@ -498,6 +779,7 @@ def update_entry(idx, label, description, day, start_txt, end_txt, duration_seco
             "duration_seconds": int(duration_seconds),
         })
         sort_activities()
+        persist()
 
 def type_picker(current_label: str, key_prefix: str):
     """Selectbox plus custom field, pre-filled from the current label."""
@@ -525,7 +807,7 @@ def tracked_today_seconds() -> float:
     total = sum(a["duration_seconds"] for a in st.session_state.activities
                 if a.get("date") == day)
     a = st.session_state.active
-    if a and a["created_at"].strftime("%Y-%m-%d") == day:
+    if a and a.get("created_at") and a["created_at"].strftime("%Y-%m-%d") == day:
         total += active_elapsed()
     return float(total)
 
@@ -534,7 +816,7 @@ def suggest_entry_time():
     day = today_str()
     starts = [a["start"] for a in st.session_state.activities if a.get("date") == day]
     a = st.session_state.active
-    if a and a["created_at"].strftime("%Y-%m-%d") == day:
+    if a and a.get("created_at") and a["created_at"].strftime("%Y-%m-%d") == day:
         starts.append(a["created_at"].strftime("%H:%M"))
     return min(starts) if starts else None
 
@@ -587,6 +869,73 @@ border-radius:6px;padding:8px 16px;margin:4px 6px 4px 0;text-align:center;min-wi
 
 def note(text: str):
     st.markdown(f"<div class='section-note'>{text}</div>", unsafe_allow_html=True)
+
+# ─── STORAGE BAR ────────────────────────────────────────────────────────────
+def render_storage_bar():
+    saved = st.session_state.get("last_saved")
+    saved_txt = saved.strftime("%H:%M:%S") if saved else "not yet"
+    dot = "#2ecc71" if STORE.durable else "#e67e22"
+    st.markdown(
+        f"<div class='store-bar'><span>"
+        f"<span style='color:{dot}'>&#9679;</span>&nbsp; {STORE.label.upper()}"
+        f"{'' if USER_ID == 'default' else ' &middot; ' + USER_ID}</span>"
+        f"<span>saved {saved_txt}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    if st.session_state.get("store_error"):
+        st.error(f"Storage problem: {st.session_state.store_error}  "
+                 f"Your work is still on screen. Download the CSV before closing.")
+
+    if not STORE.durable:
+        st.warning("No durable storage configured, so this tab is the only copy. "
+                   "See the setup note below to switch on cross-device sync.")
+
+    with st.expander("Sync, storage, and reset"):
+        st.markdown(f"**{STORE.label}.** {STORE.detail}")
+        c1, c2 = st.columns(2)
+        with c1:
+            if button("⟳  Sync from storage now", use_container_width=True, key="sync_now"):
+                pull(force=True)
+                rerun_app()
+        with c2:
+            if button("⇪  Force save now", use_container_width=True, key="save_now"):
+                if persist():
+                    st.success("Saved.")
+                rerun_app()
+
+        note("Open this same URL on any device to continue. A running timer keeps "
+             "counting the whole time, because only its start time is stored.")
+
+        if STORE.key != "gist":
+            st.markdown(
+                "To survive container recycles and device switches, create a secret "
+                "gist and a token with gist scope, then add:\n\n"
+                "```toml\n[storage]\ngithub_token = \"github_pat_...\"\n"
+                "gist_id = \"your-gist-id\"\n```"
+            )
+
+        st.markdown("---")
+        note("Nothing in this app resets on its own. This is the only button that "
+             "wipes the running timer and the whole log.")
+        if button("↺  Reset everything and start fresh", key="reset_all"):
+            close_editors()
+            st.session_state.confirm = "reset"
+            rerun_app()
+
+    if st.session_state.confirm == "reset":
+        st.warning("Reset the running timer AND every registered block? "
+                   "Download a copy first if you need it.")
+        r1, r2 = st.columns(2)
+        with r1:
+            if button("Yes, reset everything", use_container_width=True, key="conf_reset_yes"):
+                reset_everything()
+                st.session_state.confirm = None
+                rerun_app()
+        with r2:
+            if button("Cancel", use_container_width=True, key="conf_reset_no"):
+                st.session_state.confirm = None
+                rerun_app()
 
 # ─── EXPORT HELPERS ─────────────────────────────────────────────────────────
 def build_summary_text() -> str:
@@ -672,6 +1021,8 @@ def live_activity_card():
     running = a.get("running")
     status_color = "#2ecc71" if running else "#e67e22"
     status_text = "RUNNING" if running else "PAUSED"
+    since = a.get("created_at")
+    since_txt = f"since {since.strftime('%a %H:%M')}" if since else ""
     st.markdown(f"""
 <div style="background:#161616;border:1px solid {status_color}55;border-radius:10px;
 padding:18px;margin:6px 0 12px 0">
@@ -684,6 +1035,8 @@ padding:18px;margin:6px 0 12px 0">
   <div style="color:#8a8170;font-size:0.9rem;margin-top:2px">
   {a['description'] or 'No description'}</div>
   <div class="big-clock" style="margin-top:10px">{fmt_clock(elapsed)}</div>
+  <div style="color:#5f5a52;font-size:0.72rem;text-align:center;
+  font-family:'Share Tech Mono',monospace">{since_txt}</div>
 </div>""", unsafe_allow_html=True)
 
 # ─── ACTIVITY TIMER SECTION ─────────────────────────────────────────────────
@@ -725,15 +1078,15 @@ def render_timer():
     elapsed = active_elapsed()
 
     if running and elapsed > STALE_TIMER_SECONDS:
-        st.warning(f"This timer has been running for {fmt_hm(elapsed)}. If you left it "
-                   f"going by accident, edit the times after registering, or discard it.")
+        st.warning(f"This block has been running for {fmt_hm(elapsed)}. If you left it "
+                   f"going overnight, register it and fix the end time, or discard it.")
 
     if running and not HAS_FRAGMENT:
         if button("⟳  Refresh clock", key="manual_tick"):
             rerun_app()
-        note("Your Streamlit version doesn't support auto-refreshing fragments, so the "
-             "clock updates when you refresh. The elapsed time is computed from "
-             "timestamps, so nothing is lost in between.")
+        note("This Streamlit version has no auto-refreshing fragments, so the clock "
+             "updates when you refresh. The time itself is computed from the stored "
+             "start timestamp, so nothing is lost in between.")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -1045,10 +1398,11 @@ padding:8px 14px;margin:3px 0;font-family:'Barlow',sans-serif">
         rerun_app()
 
     if st.session_state.confirm == "clear":
-        st.warning("Clear the entire log? Download a copy first if you need it.")
+        st.warning("Clear the entire log? The running timer is untouched. "
+                   "Download a copy first if you need it.")
         cc1, cc2 = st.columns(2)
         with cc1:
-            if button("Yes, clear everything", use_container_width=True, key="conf_clr_yes"):
+            if button("Yes, clear the log", use_container_width=True, key="conf_clr_yes"):
                 clear_log()
                 st.session_state.confirm = None
                 rerun_app()
@@ -1331,11 +1685,7 @@ st.markdown("<p style='text-align:center;color:#8a8170;font-style:italic;font-si
             "Track your focus, capture your hours, finish strong.</p>",
             unsafe_allow_html=True)
 
-st.markdown("<div class='session-warning'><strong>This session only.</strong> Nothing is "
-            "written to disk, so your log lives in this browser tab. Reloading the page or "
-            "letting the app go idle clears it. Download the CSV or TXT before you finish "
-            "for the day.</div>", unsafe_allow_html=True)
-
+render_storage_bar()
 st.markdown("---")
 render_timer()
 render_log()
