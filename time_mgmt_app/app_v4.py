@@ -42,6 +42,7 @@ from datetime import datetime, timedelta
 import csv
 import inspect
 import io
+import hashlib
 import json
 import os
 import random
@@ -63,6 +64,8 @@ STALE_TIMER_SECONDS = 12 * 3600         # flag timers that look forgotten
 RESYNC_AFTER_SECONDS = 90               # re-read storage if state is older than this
 DATA_VERSION = 1
 LOCAL_DIR = os.path.join(os.getcwd(), ".workday_data")
+ARCHIVE_DIR = os.path.join(LOCAL_DIR, "archive")
+DEFAULT_CLOSE_HOUR = 18                 # auto backup fires from this hour onward
 
 # ─── CAPABILITY DETECTION ───────────────────────────────────────────────────
 def _tz():
@@ -224,6 +227,15 @@ class MemoryStore:
     def save(self, user, payload):
         return True, None
 
+    def write_file(self, filename, content):
+        return False, "No durable storage, so backups cannot be written."
+
+    def read_file(self, filename):
+        return None, None
+
+    def list_files(self, prefix):
+        return [], None
+
 
 class FileStore:
     """JSON on the machine running Streamlit."""
@@ -258,6 +270,37 @@ class FileStore:
             return True, None
         except Exception as e:
             return False, f"Could not write local file: {e}"
+
+    def write_file(self, filename, content):
+        try:
+            os.makedirs(ARCHIVE_DIR, exist_ok=True)
+            target = os.path.join(ARCHIVE_DIR, filename)
+            tmp = target + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp, target)
+            return True, None
+        except Exception as e:
+            return False, f"Could not write backup file: {e}"
+
+    def read_file(self, filename):
+        try:
+            target = os.path.join(ARCHIVE_DIR, filename)
+            if not os.path.exists(target):
+                return None, None
+            with open(target, "r", encoding="utf-8") as f:
+                return f.read(), None
+        except Exception as e:
+            return None, f"Could not read backup file: {e}"
+
+    def list_files(self, prefix):
+        try:
+            if not os.path.isdir(ARCHIVE_DIR):
+                return [], None
+            return sorted(n for n in os.listdir(ARCHIVE_DIR)
+                          if n.startswith(prefix)), None
+        except Exception as e:
+            return [], f"Could not list backups: {e}"
 
 
 class GistStore:
@@ -319,6 +362,39 @@ class GistStore:
         except Exception as e:
             return False, f"Gist write failed: {e}"
 
+    # Archive files live in the same gist, one file per day. Gists keep a full
+    # revision history, so an overwritten day is still recoverable.
+    def write_file(self, filename, content):
+        try:
+            self._request("PATCH", {"files": {filename: {"content": content}}})
+            return True, None
+        except urllib.error.HTTPError as e:
+            return False, f"Backup write failed ({e.code})."
+        except Exception as e:
+            return False, f"Backup write failed: {e}"
+
+    def read_file(self, filename):
+        try:
+            gist = self._request("GET")
+            entry = (gist.get("files") or {}).get(filename)
+            if not entry:
+                return None, None
+            content = entry.get("content")
+            if entry.get("truncated") and entry.get("raw_url"):
+                with urllib.request.urlopen(entry["raw_url"], timeout=12) as r:
+                    content = r.read().decode("utf-8")
+            return content, None
+        except Exception as e:
+            return None, f"Backup read failed: {e}"
+
+    def list_files(self, prefix):
+        try:
+            gist = self._request("GET")
+            return sorted(n for n in (gist.get("files") or {})
+                          if n.startswith(prefix)), None
+        except Exception as e:
+            return [], f"Could not list backups: {e}"
+
 
 def _build_store():
     """Pick the most durable backend available. Never raises."""
@@ -354,6 +430,10 @@ def serialise_state():
         "saved_at": to_iso(real_now()),
         "activities": st.session_state.activities,
         "active": active,
+        # date -> signature of what was archived, so a day is re-archived only
+        # if its content actually changed after the first backup.
+        "archived": st.session_state.get("archived", {}),
+        "emailed": st.session_state.get("emailed", {}),
     }
 
 def apply_loaded(data):
@@ -361,6 +441,8 @@ def apply_loaded(data):
     if not isinstance(data, dict):
         return
     st.session_state.activities = data.get("activities") or []
+    st.session_state.archived = data.get("archived") or {}
+    st.session_state.emailed = data.get("emailed") or {}
     a = data.get("active")
     if a:
         a = dict(a)
@@ -409,6 +491,10 @@ st.session_state.setdefault("coach_msgs", {})
 st.session_state.setdefault("last_sync", None)
 st.session_state.setdefault("last_saved", None)
 st.session_state.setdefault("store_error", None)
+st.session_state.setdefault("archived", {})
+st.session_state.setdefault("emailed", {})
+st.session_state.setdefault("backup_flash", None)
+st.session_state.setdefault("backup_error", None)
 
 # First contact with storage happens before anything renders, so a fresh
 # browser on a fresh device immediately sees the running timer.
@@ -870,6 +956,79 @@ border-radius:6px;padding:8px 16px;margin:4px 6px 4px 0;text-align:center;min-wi
 def note(text: str):
     st.markdown(f"<div class='section-note'>{text}</div>", unsafe_allow_html=True)
 
+# ─── BACKUP PANEL ───────────────────────────────────────────────────────────
+def render_backup_panel():
+    st.markdown("**End of day backups.** One dated, immutable file per day, "
+                f"written automatically from {close_hour():02d}:00 onward and on "
+                "the next time you open the app if you never did.")
+
+    today = today_str()
+    today_rows = entries_for(today)
+    if today_rows:
+        state = ("backed up" if st.session_state.archived.get(today) == day_signature(today)
+                 else "not backed up yet")
+        note(f"Today: {len(today_rows)} block(s), {state}.")
+    else:
+        note("Today: nothing registered yet.")
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if button("💾  Back up today now", use_container_width=True, key="backup_now"):
+            wrote, msg = archive_day(today, force=True)
+            email_day(today, force=True)
+            if wrote:
+                st.success(msg)
+            elif st.session_state.backup_error:
+                st.warning(st.session_state.backup_error)
+            else:
+                st.info("Nothing registered today to back up.")
+    with b2:
+        if button("💾  Back up every day", use_container_width=True, key="backup_all"):
+            days = sorted({a.get("date") for a in st.session_state.activities
+                           if a.get("date")})
+            n = sum(1 for d in days if archive_day(d, force=True)[0])
+            st.success(f"Wrote {n} daily backup file(s).") if n else st.info("Nothing to back up.")
+
+    if st.session_state.backup_error:
+        st.warning(f"Backup problem: {st.session_state.backup_error}")
+
+    names, err = STORE.list_files(archive_prefix())
+    if err:
+        note(f"Could not list backups: {err}")
+    elif names:
+        recent = ", ".join(n.replace(archive_prefix(), "").replace(".json", "")
+                           for n in names[-7:])
+        note(f"{len(names)} daily backup file(s) stored. Most recent: {recent}")
+        pick = st.selectbox("Restore a day into the log", ["(choose a date)"] +
+                            [n.replace(archive_prefix(), "").replace(".json", "")
+                             for n in reversed(names)], key="restore_pick")
+        if pick != "(choose a date)":
+            if button(f"⤓  Restore {pick} (adds missing blocks)",
+                      use_container_width=True, key="restore_go"):
+                content, rerr = STORE.read_file(f"{archive_prefix()}{pick}.json")
+                if not content:
+                    st.warning(rerr or "That backup could not be read.")
+                else:
+                    try:
+                        rows = json.loads(content).get("entries", [])
+                        have = {(a["date"], a["start"], a["end"], a["label"])
+                                for a in st.session_state.activities}
+                        added = 0
+                        for r in rows:
+                            if (r["date"], r["start"], r["end"], r["label"]) not in have:
+                                st.session_state.activities.append(r)
+                                added += 1
+                        sort_activities()
+                        persist()
+                        st.success(f"Restored {added} block(s) from {pick}.")
+                    except Exception as e:
+                        st.warning(f"Could not restore: {e}")
+    else:
+        note("No daily backup files yet.")
+
+    note("Backups go to the same private store as your live state, never to the "
+         "app's code repository.")
+
 # ─── STORAGE BAR ────────────────────────────────────────────────────────────
 def render_storage_bar():
     saved = st.session_state.get("last_saved")
@@ -914,6 +1073,9 @@ def render_storage_bar():
                 "```toml\n[storage]\ngithub_token = \"github_pat_...\"\n"
                 "gist_id = \"your-gist-id\"\n```"
             )
+
+        st.markdown("---")
+        render_backup_panel()
 
         st.markdown("---")
         note("Nothing in this app resets on its own. This is the only button that "
@@ -982,6 +1144,146 @@ def build_csv_bytes() -> bytes:
             round(a["duration_seconds"] / 60, 1),
         ])
     return buf.getvalue().encode("utf-8")
+
+# ─── END OF DAY BACKUP ──────────────────────────────────────────────────────
+# One immutable file per day, written alongside the live state. The live state
+# file is overwritten constantly; these are never touched again once the day is
+# done, so a bad edit today cannot destroy last Tuesday.
+
+def close_hour() -> int:
+    try:
+        return int(st.secrets["backup"]["hour"])
+    except Exception:
+        return DEFAULT_CLOSE_HOUR
+
+def entries_for(day: str):
+    return [a for a in st.session_state.activities if a.get("date") == day]
+
+def day_signature(day: str) -> str:
+    """
+    Stable fingerprint of a day's content, so unchanged days are not rewritten
+    and not re-emailed. This must NOT use hash(): Python randomises string
+    hashing per process, so a restart would invalidate every signature and
+    trigger a duplicate backup and duplicate email on the next page load.
+    """
+    rows = [[a["date"], a["label"], a["description"], a["start"], a["end"],
+             a["duration_seconds"]] for a in entries_for(day)]
+    blob = json.dumps(rows, sort_keys=True, ensure_ascii=False)
+    return f"{len(rows)}:{hashlib.md5(blob.encode('utf-8')).hexdigest()[:16]}"
+
+def day_csv(day: str) -> str:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["date", "label", "description", "start", "end",
+                "duration_hms", "duration_minutes"])
+    for a in entries_for(day):
+        w.writerow([a["date"], a["label"], a["description"], a["start"], a["end"],
+                    fmt_hm(a["duration_seconds"]),
+                    round(a["duration_seconds"] / 60, 1)])
+    return buf.getvalue()
+
+def day_summary(day: str) -> str:
+    rows = entries_for(day)
+    if not rows:
+        return f"No activities registered for {day}."
+    totals, total = {}, 0
+    for a in rows:
+        totals[a["label"]] = totals.get(a["label"], 0) + a["duration_seconds"]
+        total += a["duration_seconds"]
+    lines = [f"WORKDAY BACKUP {day}", ""]
+    for label in sorted(totals):
+        lines.append(f"  {label}: {fmt_hm(totals[label])}")
+    lines.append(f"  Total tracked: {fmt_hm(total)}")
+    lines += ["", "  Entries:"]
+    for a in rows:
+        desc = f" ({a['description']})" if a["description"] else ""
+        lines.append(f"    {a['start']} to {a['end']}  {a['label']}{desc}: "
+                     f"{fmt_hm(a['duration_seconds'])}")
+    return "\n".join(lines)
+
+def archive_prefix() -> str:
+    return f"backup_{USER_ID}_"
+
+def archive_day(day: str, force=False):
+    """Write one immutable dated backup. Returns (wrote, message)."""
+    rows = entries_for(day)
+    if not rows:
+        return False, None
+    sig = day_signature(day)
+    if not force and st.session_state.archived.get(day) == sig:
+        return False, None          # already backed up, nothing changed
+
+    payload = {
+        "version": DATA_VERSION,
+        "date": day,
+        "archived_at": to_iso(real_now()),
+        "user": USER_ID,
+        "total_seconds": sum(a["duration_seconds"] for a in rows),
+        "entries": rows,
+        "csv": day_csv(day),        # human-usable copy embedded in the same file
+    }
+    ok, err = STORE.write_file(f"{archive_prefix()}{day}.json",
+                               json.dumps(payload, ensure_ascii=False, indent=2))
+    if not ok:
+        st.session_state.backup_error = err
+        return False, err
+    st.session_state.archived[day] = sig
+    st.session_state.backup_error = None
+    persist()
+    return True, f"Backed up {day} ({fmt_hm(payload['total_seconds'])})."
+
+def email_day(day: str, force=False):
+    """Second channel, only if email secrets exist."""
+    if not email_configured():
+        return False, None
+    if not force and st.session_state.emailed.get(day) == day_signature(day):
+        return False, None
+    rows = entries_for(day)
+    if not rows:
+        return False, None
+    try:
+        cfg = st.secrets["email"]
+        msg = EmailMessage()
+        msg["Subject"] = f"Workday backup {day}"
+        msg["From"] = cfg["sender"]
+        msg["To"] = cfg["recipient"]
+        msg.set_content(day_summary(day))
+        msg.add_attachment(day_csv(day).encode("utf-8"), maintype="text",
+                           subtype="csv", filename=f"workday_{day}.csv")
+        with smtplib.SMTP(cfg["smtp_server"], int(cfg["smtp_port"])) as server:
+            server.starttls()
+            server.login(cfg["sender"], cfg["password"])
+            server.send_message(msg)
+        st.session_state.emailed[day] = day_signature(day)
+        persist()
+        return True, f"Emailed the {day} backup."
+    except Exception as e:
+        return False, f"Backup email failed: {e}"
+
+def auto_backup():
+    """
+    Runs on every page load. Two triggers, because a Streamlit app has no
+    scheduler and only executes while a browser session is open:
+
+      1. Catch-up: any past day that was never backed up, or changed since it
+         was, gets written now. This is what saves you when you never opened
+         the app after 18:00 yesterday.
+      2. Same-day: today is backed up once the close hour has passed, and
+         again if you register more blocks afterwards.
+    """
+    if not STORE.durable:
+        return
+    today = today_str()
+    days = sorted({a.get("date") for a in st.session_state.activities if a.get("date")})
+    done = []
+    for day in days:
+        if day < today or real_now().hour >= close_hour():
+            wrote, msg = archive_day(day)
+            if wrote:
+                done.append(msg)
+                email_day(day)
+    if done:
+        st.session_state.backup_flash = " ".join(done)
 
 def email_configured() -> bool:
     try:
@@ -1685,7 +1987,14 @@ st.markdown("<p style='text-align:center;color:#8a8170;font-style:italic;font-si
             "Track your focus, capture your hours, finish strong.</p>",
             unsafe_allow_html=True)
 
+auto_backup()          # catch-up and end-of-day backups, once per page load
+
 render_storage_bar()
+
+if st.session_state.backup_flash:
+    st.success(st.session_state.backup_flash)
+    st.session_state.backup_flash = None
+
 st.markdown("---")
 render_timer()
 render_log()
